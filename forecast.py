@@ -12,19 +12,18 @@ from pathlib import Path
 
 
 def compute_forecast_metrics_np(y_true, y_pred, erp_epsilon=0.1):
-    """
-    y_true, y_pred: numpy arrays of shape [n_products, horizon]
-    Returns: wape, mae, ts, erp
-    """
     abs_err = np.abs(y_true - y_pred)
 
-    wape = 100.0 * abs_err.sum() / max(y_true.sum(), 1e-12)
     mae = abs_err.mean()
+    wape = 100.0 * abs_err.sum() / max(y_true.sum(), 1e-12)
 
-    # Tracking Signal
-    ts = (y_true - y_pred).sum() / max(mae, 1e-12)
+    mae_per_series = abs_err.mean(axis=1)
+    mae_per_series = np.maximum(mae_per_series, 1e-12)
 
-    # ERP-style mismatch count
+    signed_error_per_series = (y_true - y_pred).sum(axis=1)
+    ts_per_series = signed_error_per_series / mae_per_series
+    ts = ts_per_series.mean()
+
     erp_per_series = (abs_err >= erp_epsilon).sum(axis=1)
     erp = erp_per_series.mean()
 
