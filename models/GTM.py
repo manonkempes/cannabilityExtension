@@ -7,6 +7,25 @@ from transformers import pipeline
 from torchvision import models
 from transformers.optimization import Adafactor
 
+def compute_forecast_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, erp_epsilon: float = 0.1):
+    """
+    y_true, y_pred: shape [n_products, horizon]
+    Returns scalar tensors: wape, mae, ts, erp
+    """
+    abs_err = torch.abs(y_true - y_pred)
+
+    wape = 100.0 * abs_err.sum() / y_true.sum().clamp(min=1e-12)
+    mae = abs_err.mean()
+
+    # Tracking Signal
+    ts = (y_true - y_pred).sum() / mae.clamp(min=1e-12)
+
+    # ERP-style mismatch count over time
+    erp_per_series = (abs_err >= erp_epsilon).float().sum(dim=1)
+    erp = erp_per_series.mean()
+
+    return wape, mae, ts, erp
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=52):
         super(PositionalEncoding, self).__init__()
@@ -370,12 +389,56 @@ class GTM(pl.LightningModule):
         return item_sales.squeeze(), forecasted_sales.squeeze()
 
     def validation_epoch_end(self, val_step_outputs):
-        item_sales, forecasted_sales = [x[0] for x in val_step_outputs], [x[1] for x in val_step_outputs]
-        item_sales, forecasted_sales = torch.stack(item_sales), torch.stack(forecasted_sales)
-        rescaled_item_sales, rescaled_forecasted_sales = item_sales*1065, forecasted_sales*1065 # 1065 is the normalization factor (max of the sales of the training set)
+        item_sales = torch.stack([x[0] for x in val_step_outputs])
+        forecasted_sales = torch.stack([x[1] for x in val_step_outputs])
+
+        # Original normalized loss
         loss = F.mse_loss(item_sales, forecasted_sales.squeeze())
-        mae = F.l1_loss(rescaled_item_sales, rescaled_forecasted_sales)
-        self.log('val_mae', mae)
+
+        # Rescaled/original-unit versions
+        rescaled_item_sales = item_sales * 1065
+        rescaled_forecasted_sales = forecasted_sales * 1065
+
+        # Normalized metrics
+        val_wape_norm, val_mae_norm, val_ts_norm, val_erp_norm = compute_forecast_metrics(
+            item_sales,
+            forecasted_sales,
+            erp_epsilon=0.1,
+        )
+
+        # Rescaled/original-unit metrics
+        val_wape, val_mae, val_ts, val_erp = compute_forecast_metrics(
+            rescaled_item_sales,
+            rescaled_forecasted_sales,
+            erp_epsilon=0.1,
+        )
+
+        # Log loss
         self.log('val_loss', loss)
 
-        print('Validation MAE:', mae.detach().cpu().numpy(), 'LR:', self.optimizers().param_groups[0]['lr'])
+        # Log normalized metrics
+        self.log('val_wape_norm', val_wape_norm, prog_bar=False)
+        self.log('val_mae_norm', val_mae_norm, prog_bar=False)
+        self.log('val_ts_norm', val_ts_norm, prog_bar=False)
+        self.log('val_erp_norm', val_erp_norm, prog_bar=False)
+
+        # Log rescaled metrics
+        self.log('val_wape', val_wape, prog_bar=False)
+        self.log('val_mae', val_mae, prog_bar=True)
+        self.log('val_ts', val_ts, prog_bar=False)
+        self.log('val_erp', val_erp, prog_bar=False)
+
+        print(
+            f"Validation normalized | "
+            f"WAPE: {val_wape_norm.item():.3f} | "
+            f"MAE: {val_mae_norm.item():.3f} | "
+            f"TS: {val_ts_norm.item():.3f} | "
+            f"ERP: {val_erp_norm.item():.3f}"
+        )
+        print(
+            f"Validation rescaled | "
+            f"WAPE: {val_wape.item():.3f} | "
+            f"MAE: {val_mae.item():.3f} | "
+            f"TS: {val_ts.item():.3f} | "
+            f"ERP: {val_erp.item():.3f}"
+        )

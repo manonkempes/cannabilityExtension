@@ -11,18 +11,32 @@ from sklearn.metrics import mean_absolute_error
 from pathlib import Path
 
 
-def cal_error_metrics(gt, forecasts):
-    # Absolute errors
-    mae = mean_absolute_error(gt, forecasts)
-    wape = 100 * np.sum(np.sum(np.abs(gt - forecasts), axis=-1)) / np.sum(gt)
+def compute_forecast_metrics_np(y_true, y_pred, erp_epsilon=0.1):
+    """
+    y_true, y_pred: numpy arrays of shape [n_products, horizon]
+    Returns: wape, mae, ts, erp
+    """
+    abs_err = np.abs(y_true - y_pred)
 
-    return round(mae, 3), round(wape, 3)
+    wape = 100.0 * abs_err.sum() / max(y_true.sum(), 1e-12)
+    mae = abs_err.mean()
+
+    # Tracking Signal
+    ts = (y_true - y_pred).sum() / max(mae, 1e-12)
+
+    # ERP-style mismatch count
+    erp_per_series = (abs_err >= erp_epsilon).sum(axis=1)
+    erp = erp_per_series.mean()
+
+    return round(wape, 3), round(mae, 3), round(ts, 3), round(erp, 3)
 
 
-def print_error_metrics(y_test, y_hat, rescaled_y_test, rescaled_y_hat):
-    mae, wape = cal_error_metrics(y_test, y_hat)
-    rescaled_mae, rescaled_wape = cal_error_metrics(rescaled_y_test, rescaled_y_hat)
-    print(mae, wape, rescaled_mae, rescaled_wape)
+def print_error_metrics(y_true, y_pred, rescaled_y_true, rescaled_y_pred):
+    wape, mae, ts, erp = compute_forecast_metrics_np(y_true, y_pred)
+    rwape, rmae, rts, rerp = compute_forecast_metrics_np(rescaled_y_true, rescaled_y_pred)
+
+    print("Normalized:", {"WAPE": wape, "MAE": mae, "TS": ts, "ERP": erp})
+    print("Rescaled:", {"WAPE": rwape, "MAE": rmae, "TS": rts, "ERP": rerp})
 
 
 def run(args):

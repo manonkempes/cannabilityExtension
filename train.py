@@ -94,9 +94,17 @@ def run(args):
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         dirpath=args.log_dir + '/'+args.model_type,
         filename=model_savename+'---{epoch}---'+dt_string,
-        monitor='val_mae',
+        monitor='val_wape',
         mode='min',
         save_top_k=1
+    )
+
+    early_stop_callback = pl.callbacks.EarlyStopping(
+        monitor='val_mae',
+        min_delta=0.0,
+        patience=5,
+        verbose=True,
+        mode='min'
     )
 
     # wandb.init(entity=args.wandb_entity, project=args.wandb_proj, name=args.wandb_run)
@@ -105,8 +113,13 @@ def run(args):
 
     # If you wish to use Tensorboard you can change the logger to:
     tb_logger = pl_loggers.TensorBoardLogger(args.log_dir+'/', name=model_savename)
-    trainer = pl.Trainer(gpus=[args.gpu_num], max_epochs=args.epochs, check_val_every_n_epoch=5,
-                         logger=tb_logger, callbacks=[checkpoint_callback])
+    trainer = pl.Trainer(
+        gpus=[args.gpu_num],
+        max_epochs=args.epochs,
+        check_val_every_n_epoch=5,
+        logger=tb_logger,
+        callbacks=[checkpoint_callback, early_stop_callback]
+    )
 
     # Fit model
     trainer.fit(model, train_dataloaders=train_loader,
