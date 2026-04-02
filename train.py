@@ -43,32 +43,40 @@ def build_dataset(
         competition_meta_path=args.competition_meta_path if use_competition else None,
         competition_top_k=args.competition_top_k,
     )
-    return dataset.get_loader(batch_size=args.batch_size if train_mode else 1, train=train_mode)
+
+    return dataset.get_loader(
+        batch_size=args.batch_size if train_mode else 1,
+        train=train_mode,
+    )
 
 
 def run(args):
     print(args)
     pl.seed_everything(args.seed)
 
+    data_folder = Path(args.data_folder)
+    log_dir = Path(args.log_dir)
+    (log_dir / args.model_type).mkdir(parents=True, exist_ok=True)
+
     train_df = pd.read_csv(
-        Path(args.data_folder) / "train.csv",
+        data_folder / "train.csv",
         parse_dates=["release_date"],
     )
 
     cat_dict = torch.load(
-        Path(args.data_folder) / "category_labels.pt",
+        data_folder / "category_labels.pt",
         weights_only=False,
     )
     col_dict = torch.load(
-        Path(args.data_folder) / "color_labels.pt",
+        data_folder / "color_labels.pt",
         weights_only=False,
     )
     fab_dict = torch.load(
-        Path(args.data_folder) / "fabric_labels.pt",
+        data_folder / "fabric_labels.pt",
         weights_only=False,
     )
     gtrends = pd.read_csv(
-        Path(args.data_folder) / "gtrends.csv",
+        data_folder / "gtrends.csv",
         index_col=[0],
         parse_dates=True,
     )
@@ -91,6 +99,7 @@ def run(args):
         fab_dict=fab_dict,
         train_mode=True,
     )
+
     val_loader = build_dataset(
         data_df=val_df,
         full_reference_df=train_df,
@@ -118,7 +127,7 @@ def run(args):
             use_encoder_mask=args.use_encoder_mask,
             gpu_num=args.gpu_num,
         )
-    else:
+    elif args.model_type == "GTM":
         model = GTM(
             embedding_dim=args.embedding_dim,
             hidden_dim=args.hidden_dim,
@@ -138,16 +147,19 @@ def run(args):
             use_competition_extension=args.use_competition_extension,
             competition_top_k=args.competition_top_k,
         )
+    else:
+        raise ValueError("model_type must be either 'FCN' or 'GTM'")
 
     dt_string = datetime.now().strftime("%d-%m-%Y-%H-%M-%S")
-    model_savename = args.model_type + "_" + args.wandb_run
+    model_savename = f"{args.model_type}_{args.wandb_run}"
 
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        dirpath=str(Path(args.log_dir) / args.model_type),
+        dirpath=str(log_dir / args.model_type),
         filename=model_savename + "---{epoch}---" + dt_string,
-        monitor="val_wape",
+        monitor="val_mae",
         mode="min",
         save_top_k=1,
+        save_last=True,
     )
 
     early_stop_callback = pl.callbacks.EarlyStopping(
@@ -158,11 +170,13 @@ def run(args):
         mode="min",
     )
 
-    tb_logger = pl_loggers.TensorBoardLogger(args.log_dir + "/", name=model_savename)
+    tb_logger = pl_loggers.TensorBoardLogger(str(log_dir), name=model_savename)
+
+    use_gpu = torch.cuda.is_available()
 
     trainer = pl.Trainer(
-        accelerator="gpu",
-        devices=[args.gpu_num],
+        accelerator="gpu" if use_gpu else "cpu",
+        devices=1,
         max_epochs=args.epochs,
         check_val_every_n_epoch=5,
         logger=tb_logger,
@@ -170,52 +184,66 @@ def run(args):
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    print(checkpoint_callback.best_model_path)
+
+    print("Best model path:", checkpoint_callback.best_model_path)
+    print("Last model path:", checkpoint_callback.last_model_path)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Zero-shot sales forecasting")
-    parser.add_argument("--data_folder", type=str, default="dataset/")
+
+    # data / output
+    parser.add_argument("--data_folder", type=str, default=".")
     parser.add_argument("--log_dir", type=str, default="log")
+
+    # training
     parser.add_argument("--seed", type=int, default=21)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--gpu_num", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=128)
+
+    # model
     parser.add_argument("--model_type", type=str, default="GTM", help="Choose between GTM or FCN")
+    parser.add_argument("--embedding_dim", type=int, default=32)
+    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--output_dim", type=int, default=12)
+    parser.add_argument("--num_attn_heads", type=int, default=4)
+    parser.add_argument("--num_hidden_layers", type=int, default=1)
+
+    # input usage
     parser.add_argument("--use_trends", type=int, default=1)
     parser.add_argument("--use_img", type=int, default=1)
     parser.add_argument("--use_text", type=int, default=1)
     parser.add_argument("--trend_len", type=int, default=52)
     parser.add_argument("--num_trends", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--embedding_dim", type=int, default=32)
-    parser.add_argument("--hidden_dim", type=int, default=64)
-    parser.add_argument("--output_dim", type=int, default=12)
     parser.add_argument("--use_encoder_mask", type=int, default=1)
     parser.add_argument("--autoregressive", type=int, default=0)
-    parser.add_argument("--num_attn_heads", type=int, default=4)
-    parser.add_argument("--num_hidden_layers", type=int, default=1)
+
+    # competition extension
     parser.add_argument("--use_competition_extension", type=int, default=0)
     parser.add_argument("--competition_top_k", type=int, default=10)
     parser.add_argument(
         "--competition_topk_indices_path",
         type=str,
-        default="dataset/train_topk_indices.npy",
+        default="train_topk_indices.npy",
     )
     parser.add_argument(
         "--competition_topk_values_path",
         type=str,
-        default="dataset/train_topk_values.npy",
+        default="train_topk_values.npy",
     )
     parser.add_argument(
         "--competition_row_mapping_path",
         type=str,
-        default="dataset/train_availability_row_mapping.csv",
+        default="train_availability_row_mapping.csv",
     )
     parser.add_argument(
         "--competition_meta_path",
         type=str,
-        default="dataset/train_extension_meta.json",
+        default="train_extension_meta.json",
     )
+
+    # naming
     parser.add_argument("--wandb_entity", type=str, default="username-here")
     parser.add_argument("--wandb_proj", type=str, default="GTM")
     parser.add_argument("--wandb_run", type=str, default="Run1")
