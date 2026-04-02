@@ -1,56 +1,108 @@
-import os
 import argparse
-import wandb
-import torch
+import os
+from datetime import datetime
+from pathlib import Path
+
 import pandas as pd
 import pytorch_lightning as pl
+import torch
 from pytorch_lightning import loggers as pl_loggers
-from pathlib import Path
-from datetime import datetime
-from models.GTM import GTM
+
 from models.FCN import FCN
+from models.GTM import GTM
 from utils.data_multitrends import ZeroShotDataset
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
+def build_dataset(
+    data_df,
+    full_reference_df,
+    args,
+    gtrends,
+    cat_dict,
+    col_dict,
+    fab_dict,
+    train_mode,
+):
+    use_competition = bool(args.use_competition_extension) and args.model_type == "GTM"
+
+    dataset = ZeroShotDataset(
+        data_df=data_df,
+        img_root=Path(args.data_folder) / "images",
+        gtrends=gtrends,
+        cat_dict=cat_dict,
+        col_dict=col_dict,
+        fab_dict=fab_dict,
+        trend_len=args.trend_len,
+        use_competition_extension=use_competition,
+        competition_reference_df=full_reference_df if use_competition else None,
+        competition_topk_indices_path=args.competition_topk_indices_path if use_competition else None,
+        competition_topk_values_path=args.competition_topk_values_path if use_competition else None,
+        competition_row_mapping_path=args.competition_row_mapping_path if use_competition else None,
+        competition_meta_path=args.competition_meta_path if use_competition else None,
+        competition_top_k=args.competition_top_k,
+    )
+    return dataset.get_loader(batch_size=args.batch_size if train_mode else 1, train=train_mode)
+
+
 def run(args):
     print(args)
-    # Seeds for reproducibility (By default we use the number 21)
     pl.seed_everything(args.seed)
 
-    # Load sales data
-    train_df = pd.read_csv(Path(args.data_folder + 'train.csv'), parse_dates=['release_date'])
+    train_df = pd.read_csv(
+        Path(args.data_folder) / "train.csv",
+        parse_dates=["release_date"],
+    )
 
-    # Load category and color encodings
-    cat_dict = torch.load(Path(args.data_folder + 'category_labels.pt'), weights_only=False)
-    col_dict = torch.load(Path(args.data_folder + 'color_labels.pt'), weights_only=False)
-    fab_dict = torch.load(Path(args.data_folder + 'fabric_labels.pt'), weights_only=False)
+    cat_dict = torch.load(
+        Path(args.data_folder) / "category_labels.pt",
+        weights_only=False,
+    )
+    col_dict = torch.load(
+        Path(args.data_folder) / "color_labels.pt",
+        weights_only=False,
+    )
+    fab_dict = torch.load(
+        Path(args.data_folder) / "fabric_labels.pt",
+        weights_only=False,
+    )
+    gtrends = pd.read_csv(
+        Path(args.data_folder) / "gtrends.csv",
+        index_col=[0],
+        parse_dates=True,
+    )
 
-    # Load Google trends
-    gtrends = pd.read_csv(Path(args.data_folder + 'gtrends.csv'), index_col=[0], parse_dates=True)
-
-    # __________________________________
-    # Sort on release date
     train_df = train_df.sort_values("release_date").reset_index(drop=True)
-
-    # Instead of using the test set as validation set, we split our train set, such that we have 85% subtrain / 15% val
-    # on date
     val_size = max(1, int(0.15 * len(train_df)))
     subtrain_df = train_df.iloc[:-val_size].copy()
     val_df = train_df.iloc[-val_size:].copy()
 
-    train_loader = ZeroShotDataset(subtrain_df, Path(args.data_folder + '/images'), gtrends,
-                                   cat_dict, col_dict, fab_dict, args.trend_len).get_loader(
-        batch_size=args.batch_size, train=True)
+    if args.use_competition_extension and args.model_type != "GTM":
+        raise ValueError("The competition extension is implemented only for model_type='GTM'.")
 
-    val_loader = ZeroShotDataset(val_df, Path(args.data_folder + '/images'), gtrends,
-                                 cat_dict, col_dict, fab_dict, args.trend_len).get_loader(
-        batch_size=1, train=False)
+    train_loader = build_dataset(
+        data_df=subtrain_df,
+        full_reference_df=train_df,
+        args=args,
+        gtrends=gtrends,
+        cat_dict=cat_dict,
+        col_dict=col_dict,
+        fab_dict=fab_dict,
+        train_mode=True,
+    )
+    val_loader = build_dataset(
+        data_df=val_df,
+        full_reference_df=train_df,
+        args=args,
+        gtrends=gtrends,
+        cat_dict=cat_dict,
+        col_dict=col_dict,
+        fab_dict=fab_dict,
+        train_mode=False,
+    )
 
-    #__________________________________
-    # Create model
-    if args.model_type == 'FCN':
+    if args.model_type == "FCN":
         model = FCN(
             embedding_dim=args.embedding_dim,
             hidden_dim=args.hidden_dim,
@@ -64,7 +116,7 @@ def run(args):
             trend_len=args.trend_len,
             num_trends=args.num_trends,
             use_encoder_mask=args.use_encoder_mask,
-            gpu_num=args.gpu_num
+            gpu_num=args.gpu_num,
         )
     else:
         model = GTM(
@@ -82,84 +134,91 @@ def run(args):
             num_trends=args.num_trends,
             use_encoder_mask=args.use_encoder_mask,
             autoregressive=args.autoregressive,
-            gpu_num=args.gpu_num
+            gpu_num=args.gpu_num,
+            use_competition_extension=args.use_competition_extension,
+            competition_top_k=args.competition_top_k,
         )
 
-    # Model Training
-    # Define model saving procedure
     dt_string = datetime.now().strftime("%d-%m-%Y-%H-%M-%S")
-
-    model_savename = args.model_type + '_' + args.wandb_run
+    model_savename = args.model_type + "_" + args.wandb_run
 
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        dirpath=args.log_dir + '/'+args.model_type,
-        filename=model_savename+'---{epoch}---'+dt_string,
-        monitor='val_wape',
-        mode='min',
-        save_top_k=1
+        dirpath=str(Path(args.log_dir) / args.model_type),
+        filename=model_savename + "---{epoch}---" + dt_string,
+        monitor="val_wape",
+        mode="min",
+        save_top_k=1,
     )
 
     early_stop_callback = pl.callbacks.EarlyStopping(
-        monitor='val_mae',
+        monitor="val_mae",
         min_delta=0.0,
         patience=5,
         verbose=True,
-        mode='min'
+        mode="min",
     )
 
-    # wandb.init(entity=args.wandb_entity, project=args.wandb_proj, name=args.wandb_run)
-    # wandb_logger = pl_loggers.WandbLogger()
-    # wandb_logger.watch(model)
+    tb_logger = pl_loggers.TensorBoardLogger(args.log_dir + "/", name=model_savename)
 
-    # If you wish to use Tensorboard you can change the logger to:
-    tb_logger = pl_loggers.TensorBoardLogger(args.log_dir+'/', name=model_savename)
     trainer = pl.Trainer(
-        accelerator='gpu',
+        accelerator="gpu",
         devices=[args.gpu_num],
         max_epochs=args.epochs,
         check_val_every_n_epoch=5,
         logger=tb_logger,
-        callbacks=[checkpoint_callback, early_stop_callback]
+        callbacks=[checkpoint_callback, early_stop_callback],
     )
 
-    # Fit model
-    trainer.fit(model, train_dataloaders=train_loader,
-                val_dataloaders=val_loader)
-
-    # Print out path of best model
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
     print(checkpoint_callback.best_model_path)
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Zero-shot sales forecasting')
-
-    # General arguments
-    parser.add_argument('--data_folder', type=str, default='dataset/')
-    parser.add_argument('--log_dir', type=str, default='log')
-    parser.add_argument('--seed', type=int, default=21)
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--gpu_num', type=int, default=0)
-
-    # Model specific arguments
-    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM or FCN')
-    parser.add_argument('--use_trends', type=int, default=1)
-    parser.add_argument('--use_img', type=int, default=1)
-    parser.add_argument('--use_text', type=int, default=1)
-    parser.add_argument('--trend_len', type=int, default=52)
-    parser.add_argument('--num_trends', type=int, default=3)
-    parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--embedding_dim', type=int, default=32)
-    parser.add_argument('--hidden_dim', type=int, default=64)
-    parser.add_argument('--output_dim', type=int, default=12)
-    parser.add_argument('--use_encoder_mask', type=int, default=1)
-    parser.add_argument('--autoregressive', type=int, default=0)
-    parser.add_argument('--num_attn_heads', type=int, default=4)
-    parser.add_argument('--num_hidden_layers', type=int, default=1)
-
-    # wandb arguments
-    parser.add_argument('--wandb_entity', type=str, default='username-here')
-    parser.add_argument('--wandb_proj', type=str, default='GTM')
-    parser.add_argument('--wandb_run', type=str, default='Run1')
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Zero-shot sales forecasting")
+    parser.add_argument("--data_folder", type=str, default="dataset/")
+    parser.add_argument("--log_dir", type=str, default="log")
+    parser.add_argument("--seed", type=int, default=21)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--gpu_num", type=int, default=0)
+    parser.add_argument("--model_type", type=str, default="GTM", help="Choose between GTM or FCN")
+    parser.add_argument("--use_trends", type=int, default=1)
+    parser.add_argument("--use_img", type=int, default=1)
+    parser.add_argument("--use_text", type=int, default=1)
+    parser.add_argument("--trend_len", type=int, default=52)
+    parser.add_argument("--num_trends", type=int, default=3)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--embedding_dim", type=int, default=32)
+    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--output_dim", type=int, default=12)
+    parser.add_argument("--use_encoder_mask", type=int, default=1)
+    parser.add_argument("--autoregressive", type=int, default=0)
+    parser.add_argument("--num_attn_heads", type=int, default=4)
+    parser.add_argument("--num_hidden_layers", type=int, default=1)
+    parser.add_argument("--use_competition_extension", type=int, default=0)
+    parser.add_argument("--competition_top_k", type=int, default=10)
+    parser.add_argument(
+        "--competition_topk_indices_path",
+        type=str,
+        default="dataset/train_topk_indices.npy",
+    )
+    parser.add_argument(
+        "--competition_topk_values_path",
+        type=str,
+        default="dataset/train_topk_values.npy",
+    )
+    parser.add_argument(
+        "--competition_row_mapping_path",
+        type=str,
+        default="dataset/train_availability_row_mapping.csv",
+    )
+    parser.add_argument(
+        "--competition_meta_path",
+        type=str,
+        default="dataset/train_extension_meta.json",
+    )
+    parser.add_argument("--wandb_entity", type=str, default="username-here")
+    parser.add_argument("--wandb_proj", type=str, default="GTM")
+    parser.add_argument("--wandb_run", type=str, default="Run1")
 
     args = parser.parse_args()
     run(args)

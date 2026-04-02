@@ -1,25 +1,24 @@
 import argparse
-import torch
-import pandas as pd
-import numpy as np
-import pytorch_lightning as pl
-from tqdm import tqdm
-from models.GTM import GTM
-from models.FCN import FCN
-from utils.data_multitrends import ZeroShotDataset
-from sklearn.metrics import mean_absolute_error
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytorch_lightning as pl
+import torch
+from tqdm import tqdm
+
+from models.FCN import FCN
+from models.GTM import GTM
+from utils.data_multitrends import ZeroShotDataset
 
 
 def compute_forecast_metrics_np(y_true, y_pred, erp_epsilon=0.1):
     abs_err = np.abs(y_true - y_pred)
-
     mae = abs_err.mean()
     wape = 100.0 * abs_err.sum() / max(y_true.sum(), 1e-12)
 
     mae_per_series = abs_err.mean(axis=1)
     mae_per_series = np.maximum(mae_per_series, 1e-12)
-
     signed_error_per_series = (y_true - y_pred).sum(axis=1)
     ts_per_series = signed_error_per_series / mae_per_series
     ts = ts_per_series.mean()
@@ -38,35 +37,110 @@ def print_error_metrics(y_true, y_pred, rescaled_y_true, rescaled_y_pred):
     print("Rescaled:", {"WAPE": rwape, "MAE": rmae, "TS": rts, "ERP": rerp})
 
 
+def build_test_loader(test_df, args, gtrends, cat_dict, col_dict, fab_dict):
+    use_competition = bool(args.use_competition_extension) and args.model_type == "GTM"
+
+    dataset = ZeroShotDataset(
+        data_df=test_df,
+        img_root=Path(args.data_folder) / "images",
+        gtrends=gtrends,
+        cat_dict=cat_dict,
+        col_dict=col_dict,
+        fab_dict=fab_dict,
+        trend_len=args.trend_len,
+        use_competition_extension=use_competition,
+        competition_reference_df=test_df if use_competition else None,
+        competition_topk_indices_path=args.competition_topk_indices_path if use_competition else None,
+        competition_topk_values_path=args.competition_topk_values_path if use_competition else None,
+        competition_row_mapping_path=args.competition_row_mapping_path if use_competition else None,
+        competition_meta_path=args.competition_meta_path if use_competition else None,
+        competition_top_k=args.competition_top_k,
+    )
+    return dataset.get_loader(batch_size=1, train=False)
+
+
+def unpack_and_forward(model, batch):
+    if len(batch) == 7:
+        item_sales, category, color, fabric, temporal_features, gtrends, images = batch
+        y_pred, attn, _ = model(
+            category,
+            color,
+            fabric,
+            temporal_features,
+            gtrends,
+            images,
+        )
+        return item_sales, y_pred, attn
+
+    (
+        item_sales,
+        category,
+        color,
+        fabric,
+        temporal_features,
+        gtrends,
+        images,
+        neighbor_categories,
+        neighbor_colors,
+        neighbor_fabrics,
+        neighbor_images,
+        neighbor_scores,
+        neighbor_mask,
+    ) = batch
+
+    y_pred, attn, _ = model(
+        category,
+        color,
+        fabric,
+        temporal_features,
+        gtrends,
+        images,
+        neighbor_categories=neighbor_categories,
+        neighbor_colors=neighbor_colors,
+        neighbor_fabrics=neighbor_fabrics,
+        neighbor_images=neighbor_images,
+        neighbor_scores=neighbor_scores,
+        neighbor_mask=neighbor_mask,
+    )
+    return item_sales, y_pred, attn
+
+
 def run(args):
     print(args)
-
-    # Set up CUDA
-    device = torch.device(f'cuda:{args.gpu_num}' if torch.cuda.is_available() else 'cpu')
-
-    # Seeds for reproducibility
+    device = torch.device(f"cuda:{args.gpu_num}" if torch.cuda.is_available() else "cpu")
     pl.seed_everything(args.seed)
 
-    # Load sales data
-    test_df = pd.read_csv(Path(args.data_folder + 'test.csv'), parse_dates=['release_date'])
-    item_codes = test_df['external_code'].values
+    test_df = pd.read_csv(
+        Path(args.data_folder) / "test.csv",
+        parse_dates=["release_date"],
+    )
+    item_codes = test_df["external_code"].values
 
-    # Load category and color encodings
-    cat_dict = torch.load(Path(args.data_folder + 'category_labels.pt'), weights_only=False)
-    col_dict = torch.load(Path(args.data_folder + 'color_labels.pt'), weights_only=False)
-    fab_dict = torch.load(Path(args.data_folder + 'fabric_labels.pt'), weights_only=False)
+    cat_dict = torch.load(
+        Path(args.data_folder) / "category_labels.pt",
+        weights_only=False,
+    )
+    col_dict = torch.load(
+        Path(args.data_folder) / "color_labels.pt",
+        weights_only=False,
+    )
+    fab_dict = torch.load(
+        Path(args.data_folder) / "fabric_labels.pt",
+        weights_only=False,
+    )
+    gtrends = pd.read_csv(
+        Path(args.data_folder) / "gtrends.csv",
+        index_col=[0],
+        parse_dates=True,
+    )
 
-    # Load Google trends
-    gtrends = pd.read_csv(Path(args.data_folder + 'gtrends.csv'), index_col=[0], parse_dates=True)
+    if args.use_competition_extension and args.model_type != "GTM":
+        raise ValueError("The competition extension is implemented only for model_type='GTM'.")
 
-    test_loader = ZeroShotDataset(test_df, Path(args.data_folder + '/images'), gtrends, cat_dict, col_dict, \
-                                  fab_dict, args.trend_len).get_loader(batch_size=1, train=False)
+    test_loader = build_test_loader(test_df, args, gtrends, cat_dict, col_dict, fab_dict)
+    model_savename = f"{args.wandb_run}_model{args.model_output_dim}_eval{args.eval_horizon}"
 
-    model_savename = f'{args.wandb_run}_model{args.model_output_dim}_eval{args.eval_horizon}'
-
-    # Create model
-    model = None
-    if args.model_type == 'FCN':
+    if args.model_type == "FCN":
         model = FCN(
             embedding_dim=args.embedding_dim,
             hidden_dim=args.hidden_dim,
@@ -80,7 +154,7 @@ def run(args):
             trend_len=args.trend_len,
             num_trends=args.num_trends,
             use_encoder_mask=args.use_encoder_mask,
-            gpu_num=args.gpu_num
+            gpu_num=args.gpu_num,
         )
     else:
         model = GTM(
@@ -98,89 +172,104 @@ def run(args):
             num_trends=args.num_trends,
             use_encoder_mask=args.use_encoder_mask,
             autoregressive=args.autoregressive,
-            gpu_num=args.gpu_num
+            gpu_num=args.gpu_num,
+            use_competition_extension=args.use_competition_extension,
+            competition_top_k=args.competition_top_k,
         )
 
-    # Fail if the checkpoint and model architecture don't match
     ckpt = torch.load(args.ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['state_dict'], strict=True)
-
-    # Forecast the testing set
+    model.load_state_dict(ckpt["state_dict"], strict=True)
     model.to(device)
     model.eval()
+
     gt, forecasts, attns = [], [], []
-    for test_data in tqdm(test_loader, total=len(test_loader), ascii=True):
+    for batch in tqdm(test_loader, total=len(test_loader), ascii=True):
         with torch.no_grad():
-            test_data = [tensor.to(device) for tensor in test_data]
-            item_sales, category, color, textures, temporal_features, gtrends, images = test_data
-            y_pred, att = model(category, color, textures, temporal_features, gtrends, images)
+            batch = [tensor.to(device) if torch.is_tensor(tensor) else tensor for tensor in batch]
+            item_sales, y_pred, att = unpack_and_forward(model, batch)
 
-            # Make sure you cut the evaluation horizon instead of the model architecture
-            y_pred_np = y_pred.detach().cpu().numpy().reshape(-1)
-            y_true_np = item_sales.detach().cpu().numpy().reshape(-1)
-            forecasts.append(y_pred_np[:args.eval_horizon])
-            gt.append(y_true_np[:args.eval_horizon])
+        y_pred_np = y_pred.detach().cpu().numpy().reshape(-1)
+        y_true_np = item_sales.detach().cpu().numpy().reshape(-1)
 
+        forecasts.append(y_pred_np[: args.eval_horizon])
+        gt.append(y_true_np[: args.eval_horizon])
+
+        if att is None:
+            attns.append(np.zeros((1,), dtype=np.float32))
+        else:
             attns.append(att.detach().cpu().numpy())
 
-    attns = np.stack(attns)
+    attns = np.array(attns, dtype=object)
     forecasts = np.array(forecasts)
     gt = np.array(gt)
 
-    # rescale_vals = np.load(args.data_folder + 'normalization_scale.npy')[:args.eval_horizon]
-
-    # Rescale the values in such a way that it won't end up with a 0-dimentional vector
-    scale = float(np.load(Path(args.data_folder) / 'normalization_scale.npy'))
+    scale = float(np.load(Path(args.data_folder) / "normalization_scale.npy"))
     rescale_vals = np.full(args.eval_horizon, scale, dtype=np.float32)
-
     rescaled_forecasts = forecasts * rescale_vals
     rescaled_gt = gt * rescale_vals
+
     print_error_metrics(gt, forecasts, rescaled_gt, rescaled_forecasts)
 
-    Path('results').mkdir(parents=True, exist_ok=True)
-    torch.save({'results': rescaled_forecasts, 'gts': rescaled_gt, 'codes': item_codes.tolist()},
-               Path('results/' + model_savename + '.pth'))
+    Path("results").mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "results": rescaled_forecasts,
+            "gts": rescaled_gt,
+            "codes": item_codes.tolist(),
+            "attns": attns,
+        },
+        Path("results") / f"{model_savename}.pth",
+    )
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Zero-shot sales forecasting')
-
-    # General arguments
-    parser.add_argument('--data_folder', type=str, default='dataset/')
-    parser.add_argument('--ckpt_path', type=str, default='log/path-to-model.ckpt')
-    parser.add_argument('--gpu_num', type=int, default=0)
-    parser.add_argument('--seed', type=int, default=21)
-
-    # Model specific arguments
-    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM or FCN')
-    parser.add_argument('--use_trends', type=int, default=1)
-    parser.add_argument('--use_img', type=int, default=1)
-    parser.add_argument('--use_text', type=int, default=1)
-    parser.add_argument('--trend_len', type=int, default=52)
-    parser.add_argument('--num_trends', type=int, default=3)
-    parser.add_argument('--embedding_dim', type=int, default=32)
-    parser.add_argument('--hidden_dim', type=int, default=64)
-
-    # Instead of using the output_dim for the model and for the evaluation we split this such that you do not change
-    # the model when having two different values
-    parser.add_argument('--model_output_dim', type=int, default=12)
-    parser.add_argument('--eval_horizon', type=int, default=12)
-
-    parser.add_argument('--use_encoder_mask', type=int, default=1)
-    parser.add_argument('--autoregressive', type=int, default=0)
-    parser.add_argument('--num_attn_heads', type=int, default=4)
-    parser.add_argument('--num_hidden_layers', type=int, default=1)
-
-    # wandb arguments
-    parser.add_argument('--wandb_run', type=str, default='Run1')
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Zero-shot sales forecasting")
+    parser.add_argument("--data_folder", type=str, default="dataset/")
+    parser.add_argument("--ckpt_path", type=str, default="log/path-to-model.ckpt")
+    parser.add_argument("--gpu_num", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=21)
+    parser.add_argument("--model_type", type=str, default="GTM", help="Choose between GTM or FCN")
+    parser.add_argument("--use_trends", type=int, default=1)
+    parser.add_argument("--use_img", type=int, default=1)
+    parser.add_argument("--use_text", type=int, default=1)
+    parser.add_argument("--trend_len", type=int, default=52)
+    parser.add_argument("--num_trends", type=int, default=3)
+    parser.add_argument("--embedding_dim", type=int, default=32)
+    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--model_output_dim", type=int, default=12)
+    parser.add_argument("--eval_horizon", type=int, default=12)
+    parser.add_argument("--use_encoder_mask", type=int, default=1)
+    parser.add_argument("--autoregressive", type=int, default=0)
+    parser.add_argument("--num_attn_heads", type=int, default=4)
+    parser.add_argument("--num_hidden_layers", type=int, default=1)
+    parser.add_argument("--use_competition_extension", type=int, default=0)
+    parser.add_argument("--competition_top_k", type=int, default=10)
+    parser.add_argument(
+        "--competition_topk_indices_path",
+        type=str,
+        default="dataset/test_topk_indices.npy",
+    )
+    parser.add_argument(
+        "--competition_topk_values_path",
+        type=str,
+        default="dataset/test_topk_values.npy",
+    )
+    parser.add_argument(
+        "--competition_row_mapping_path",
+        type=str,
+        default="dataset/test_availability_row_mapping.csv",
+    )
+    parser.add_argument(
+        "--competition_meta_path",
+        type=str,
+        default="dataset/test_extension_meta.json",
+    )
+    parser.add_argument("--wandb_run", type=str, default="Run1")
 
     args = parser.parse_args()
-
-    # Add to check if the evaluation size is smaller than the model output size
     if args.eval_horizon > args.model_output_dim:
         raise ValueError(
             f"eval_horizon ({args.eval_horizon}) cannot be bigger than "
             f"model_output_dim ({args.model_output_dim})."
         )
-
     run(args)
