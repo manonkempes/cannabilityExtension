@@ -1,12 +1,12 @@
 import json
 import os
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 from PIL import Image, ImageFile
-from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import Compose, Normalize, Resize, ToTensor
 from tqdm import tqdm
@@ -23,11 +23,15 @@ def floor_to_monday(timestamp: pd.Timestamp) -> pd.Timestamp:
 def safe_minmax_scale(values: np.ndarray) -> np.ndarray:
     """Scale a 1D array to [0, 1] while handling constant arrays safely."""
     values = np.asarray(values, dtype=np.float32)
-    if len(values) == 0:
+    if values.size == 0:
         return values
-    if np.allclose(values.max(), values.min()):
+
+    vmin = float(values.min())
+    vmax = float(values.max())
+    if np.isclose(vmax, vmin):
         return np.zeros_like(values, dtype=np.float32)
-    return MinMaxScaler().fit_transform(values.reshape(-1, 1)).flatten().astype(np.float32)
+
+    return ((values - vmin) / (vmax - vmin)).astype(np.float32)
 
 
 class LazyDataset(Dataset):
@@ -71,6 +75,7 @@ class LazyDataset(Dataset):
         neighbor_img_paths=None,
         neighbor_scores=None,
         neighbor_mask=None,
+        image_cache_size=4096,
     ):
         self.item_sales = item_sales
         self.categories = categories
@@ -87,35 +92,64 @@ class LazyDataset(Dataset):
         self.neighbor_img_paths = neighbor_img_paths
         self.neighbor_scores = neighbor_scores
         self.neighbor_mask = neighbor_mask
+
         self.use_competition_extension = neighbor_categories is not None
+
+        try:
+            resize = Resize((256, 256), interpolation=Image.Resampling.BILINEAR)
+        except AttributeError:
+            resize = Resize((256, 256))
 
         self.transforms = Compose(
             [
-                Resize((256, 256)),
+                resize,
                 ToTensor(),
-                Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
             ]
         )
+
         self.zero_image = torch.zeros(3, 256, 256, dtype=torch.float32)
+        self.image_cache_size = max(0, int(image_cache_size))
+        self._image_cache = OrderedDict()
 
     def __len__(self):
         return len(self.item_sales)
 
-    def _load_image(self, relative_path: str) -> torch.Tensor:
-        """
-        Load an RGB image and apply the same transforms as the baseline code.
-        Invalid or missing files are replaced by a zero image so that the
-        dataloader does not crash mid-training.
-        """
+    def _evict_if_needed(self):
+        while len(self._image_cache) > self.image_cache_size:
+            self._image_cache.popitem(last=False)
+
+    def _read_image(self, relative_path: str) -> torch.Tensor:
         if relative_path is None or relative_path == "":
-            return self.zero_image.clone()
+            return self.zero_image
 
         image_path = os.path.join(self.img_root, relative_path)
         try:
-            img = Image.open(image_path).convert("RGB")
-            return self.transforms(img)
+            with Image.open(image_path) as img:
+                img = img.convert("RGB")
+                return self.transforms(img)
         except Exception:
-            return self.zero_image.clone()
+            return self.zero_image
+
+    def _load_image(self, relative_path: str) -> torch.Tensor:
+        if relative_path is None or relative_path == "":
+            return self.zero_image
+
+        if self.image_cache_size > 0 and relative_path in self._image_cache:
+            cached = self._image_cache.pop(relative_path)
+            self._image_cache[relative_path] = cached
+            return cached
+
+        image_tensor = self._read_image(relative_path)
+
+        if self.image_cache_size > 0:
+            self._image_cache[relative_path] = image_tensor
+            self._evict_if_needed()
+
+        return image_tensor
 
     def __getitem__(self, idx):
         target_image = self._load_image(self.img_paths[idx])
@@ -133,15 +167,13 @@ class LazyDataset(Dataset):
         if not self.use_competition_extension:
             return base_tuple
 
-        neighbor_imgs = []
-        for rel_path, valid in zip(
-            self.neighbor_img_paths[idx],
-            self.neighbor_mask[idx].tolist(),
-        ):
-            if valid > 0:
-                neighbor_imgs.append(self._load_image(rel_path))
-            else:
-                neighbor_imgs.append(self.zero_image.clone())
+        row_neighbor_paths = self.neighbor_img_paths[idx]
+        row_neighbor_mask = self.neighbor_mask[idx]
+
+        neighbor_imgs = [
+            self._load_image(rel_path) if float(valid) > 0 else self.zero_image
+            for rel_path, valid in zip(row_neighbor_paths, row_neighbor_mask.tolist())
+        ]
         neighbor_imgs = torch.stack(neighbor_imgs, dim=0)
 
         return base_tuple + (
@@ -182,12 +214,20 @@ class ZeroShotDataset:
 
         self.use_competition_extension = bool(use_competition_extension)
         self.competition_top_k = competition_top_k
+
         self.competition_reference_df = None
         self.topk_indices = None
         self.topk_values = None
         self.week_to_index = None
         self.external_code_to_product_index = None
-        self.product_index_to_reference_row = None
+
+        self.reference_category_ids = None
+        self.reference_color_ids = None
+        self.reference_fabric_ids = None
+        self.reference_image_paths = None
+
+        self._gtrend_cache = {}
+        self._competition_snapshot_cache = {}
 
         if self.use_competition_extension:
             if competition_reference_df is None:
@@ -206,9 +246,7 @@ class ZeroShotDataset:
                     "All competition paths must be provided when the competition extension is enabled."
                 )
 
-            self.competition_reference_df = competition_reference_df.copy().reset_index(
-                drop=True
-            )
+            self.competition_reference_df = competition_reference_df.copy().reset_index(drop=True)
             self._load_competition_artifacts(
                 competition_topk_indices_path=competition_topk_indices_path,
                 competition_topk_values_path=competition_topk_values_path,
@@ -224,15 +262,14 @@ class ZeroShotDataset:
         competition_meta_path,
     ):
         """Load the precomputed Top-K competition neighborhood files."""
-        self.topk_indices = np.load(competition_topk_indices_path)
-        self.topk_values = np.load(competition_topk_values_path)
+        self.topk_indices = np.load(competition_topk_indices_path, mmap_mode="r")
+        self.topk_values = np.load(competition_topk_values_path, mmap_mode="r")
 
-        row_mapping = pd.read_csv(competition_row_mapping_path)
+        row_mapping = pd.read_csv(competition_row_mapping_path, usecols=["external_code"])
         row_mapping["external_code"] = row_mapping["external_code"].astype(str)
 
         meta = json.loads(Path(competition_meta_path).read_text())
         week_columns = meta["week_columns"]
-
         self.week_to_index = {week_label: idx for idx, week_label in enumerate(week_columns)}
         self.external_code_to_product_index = {
             code: idx for idx, code in enumerate(row_mapping["external_code"].tolist())
@@ -240,55 +277,73 @@ class ZeroShotDataset:
 
         reference_df = self.competition_reference_df.copy()
         reference_df["external_code"] = reference_df["external_code"].astype(str)
-        reference_by_code = {
-            code: row for code, row in reference_df.set_index("external_code").iterrows()
-        }
+        reference_df = reference_df.set_index("external_code")
 
-        self.product_index_to_reference_row = []
-        for code in row_mapping["external_code"].tolist():
-            if code not in reference_by_code:
+        num_products = len(row_mapping)
+        self.reference_category_ids = np.zeros(num_products, dtype=np.int64)
+        self.reference_color_ids = np.zeros(num_products, dtype=np.int64)
+        self.reference_fabric_ids = np.zeros(num_products, dtype=np.int64)
+        self.reference_image_paths = [""] * num_products
+
+        for idx, code in enumerate(row_mapping["external_code"].tolist()):
+            if code not in reference_df.index:
                 raise ValueError(
                     f"Product '{code}' was found in the competition files but not in competition_reference_df."
                 )
-            self.product_index_to_reference_row.append(reference_by_code[code])
 
-        if self.topk_indices.shape[:2] != (
-            len(week_columns),
-            len(self.product_index_to_reference_row),
-        ):
+            row = reference_df.loc[code]
+            self.reference_category_ids[idx] = self.cat_dict[row["category"]]
+            self.reference_color_ids[idx] = self.col_dict[row["color"]]
+            self.reference_fabric_ids[idx] = self.fab_dict[row["fabric"]]
+            self.reference_image_paths[idx] = row["image_path"]
+
+        expected_shape = (len(week_columns), num_products)
+        if self.topk_indices.shape[:2] != expected_shape:
             raise ValueError(
                 "The Top-K tensors do not match the metadata dimensions. "
-                f"Expected {(len(week_columns), len(self.product_index_to_reference_row))}, "
-                f"got {self.topk_indices.shape[:2]}."
+                f"Expected {expected_shape}, got {self.topk_indices.shape[:2]}."
             )
 
     def _extract_temporal_features(self, data: pd.DataFrame) -> torch.FloatTensor:
         """
         Extract the four temporal features used by the baseline model.
+
         If the named columns are present, use them explicitly.
         Otherwise, fall back to the original positional slicing.
         """
         expected_cols = ["day", "week", "month", "year"]
         if all(col in data.columns for col in expected_cols):
-            return torch.FloatTensor(data[expected_cols].values)
-        return torch.FloatTensor(data.iloc[:, 13:17].values)
+            arr = data[expected_cols].to_numpy(dtype=np.float32, copy=True)
+            return torch.from_numpy(arr)
+
+        arr = data.iloc[:, 13:17].to_numpy(dtype=np.float32, copy=True)
+        return torch.from_numpy(arr)
 
     def _get_sales_tensor(self, data: pd.DataFrame) -> torch.FloatTensor:
         """
         Return the 12-week target horizon.
+
         The original repository takes the first 12 columns as the target horizon,
         so the same assumption is preserved here.
         """
-        return torch.FloatTensor(data.iloc[:, :12].values)
+        arr = data.iloc[:, :12].to_numpy(dtype=np.float32, copy=True)
+        return torch.from_numpy(arr)
 
     def _get_scaled_gtrend(self, label: str, start_date: pd.Timestamp) -> np.ndarray:
         """
         Return the normalized Google Trends history for a single attribute.
+
         The series is padded with zeros if it is shorter than trend_len.
         """
+        start_date = pd.Timestamp(start_date).normalize()
+        cache_key = (label, start_date)
+
+        if cache_key in self._gtrend_cache:
+            return self._gtrend_cache[cache_key]
+
         gtrend_start = start_date - pd.DateOffset(weeks=52)
         try:
-            series = self.gtrends.loc[gtrend_start:start_date][label].values[-52:]
+            series = self.gtrends.loc[gtrend_start:start_date, label].values[-52:]
         except KeyError:
             series = np.zeros(self.trend_len, dtype=np.float32)
 
@@ -299,90 +354,100 @@ class ZeroShotDataset:
             pad = np.zeros(self.trend_len - len(series), dtype=np.float32)
             series = np.concatenate([pad, series], axis=0)
 
-        return safe_minmax_scale(series)
+        scaled = safe_minmax_scale(series)
+        self._gtrend_cache[cache_key] = scaled
+        return scaled
 
-    def _build_competition_snapshot(self, row: pd.Series):
+    def _build_competition_snapshot(self, row):
         """
         Build the launch-week Top-K neighborhood for one target product.
+
         This first integration uses the launch week as the assortment snapshot
         to stay compatible with the current GTM decoder.
         """
-        target_code = str(row["external_code"])
-        product_index = self.external_code_to_product_index[target_code]
+        target_code = str(row.external_code)
+        launch_week_label = floor_to_monday(pd.Timestamp(row.release_date)).strftime("%Y-%m-%d")
+        cache_key = (target_code, launch_week_label)
 
-        launch_week_label = floor_to_monday(pd.Timestamp(row["release_date"])).strftime(
-            "%Y-%m-%d"
-        )
+        if cache_key in self._competition_snapshot_cache:
+            return self._competition_snapshot_cache[cache_key]
+
+        if target_code not in self.external_code_to_product_index:
+            raise ValueError(f"Product '{target_code}' was not found in the competition mapping.")
+
         if launch_week_label not in self.week_to_index:
             raise ValueError(
                 f"Launch week '{launch_week_label}' was not found in the competition metadata."
             )
+
+        product_index = self.external_code_to_product_index[target_code]
         week_index = self.week_to_index[launch_week_label]
 
-        neighbor_indices = self.topk_indices[
-            week_index, product_index, : self.competition_top_k
-        ]
-        neighbor_scores = self.topk_values[
-            week_index, product_index, : self.competition_top_k
-        ]
+        neighbor_indices = np.asarray(
+            self.topk_indices[week_index, product_index, : self.competition_top_k]
+        ).astype(np.int64, copy=False)
+        neighbor_scores = np.asarray(
+            self.topk_values[week_index, product_index, : self.competition_top_k]
+        ).astype(np.float32, copy=False)
 
-        neighbor_categories = []
-        neighbor_colors = []
-        neighbor_fabrics = []
-        neighbor_img_paths = []
-        neighbor_mask = []
+        valid = (neighbor_indices != -1) & (neighbor_scores > 0)
+        safe_indices = neighbor_indices.copy()
+        safe_indices[~valid] = 0
 
-        for neighbor_index, score in zip(neighbor_indices.tolist(), neighbor_scores.tolist()):
-            if neighbor_index == -1 or score <= 0:
-                neighbor_categories.append(0)
-                neighbor_colors.append(0)
-                neighbor_fabrics.append(0)
-                neighbor_img_paths.append("")
-                neighbor_mask.append(0.0)
-                continue
+        neighbor_categories = self.reference_category_ids[safe_indices].astype(np.int64, copy=True)
+        neighbor_colors = self.reference_color_ids[safe_indices].astype(np.int64, copy=True)
+        neighbor_fabrics = self.reference_fabric_ids[safe_indices].astype(np.int64, copy=True)
+        neighbor_mask = valid.astype(np.float32, copy=False)
 
-            neighbor_row = self.product_index_to_reference_row[neighbor_index]
-            neighbor_categories.append(self.cat_dict[neighbor_row["category"]])
-            neighbor_colors.append(self.col_dict[neighbor_row["color"]])
-            neighbor_fabrics.append(self.fab_dict[neighbor_row["fabric"]])
-            neighbor_img_paths.append(neighbor_row["image_path"])
-            neighbor_mask.append(1.0)
+        neighbor_img_paths = [self.reference_image_paths[idx] for idx in safe_indices.tolist()]
+        for i, is_valid in enumerate(valid.tolist()):
+            if not is_valid:
+                neighbor_img_paths[i] = ""
 
-        return (
+        result = (
             neighbor_categories,
             neighbor_colors,
             neighbor_fabrics,
             neighbor_img_paths,
-            neighbor_scores.astype(np.float32),
-            np.asarray(neighbor_mask, dtype=np.float32),
+            neighbor_scores.astype(np.float32, copy=True),
+            neighbor_mask.astype(np.float32, copy=True),
         )
+        self._competition_snapshot_cache[cache_key] = result
+        return result
 
     def preprocess_data(self):
         data = self.data_df.copy()
+        num_rows = len(data)
 
-        multitrends = []
-        image_paths = []
+        multitrends = np.empty((num_rows, 3, self.trend_len), dtype=np.float32)
+        image_paths = [""] * num_rows
 
-        neighbor_categories_all = []
-        neighbor_colors_all = []
-        neighbor_fabrics_all = []
-        neighbor_img_paths_all = []
-        neighbor_scores_all = []
-        neighbor_mask_all = []
+        if self.use_competition_extension:
+            neighbor_categories_all = np.empty(
+                (num_rows, self.competition_top_k), dtype=np.int64
+            )
+            neighbor_colors_all = np.empty(
+                (num_rows, self.competition_top_k), dtype=np.int64
+            )
+            neighbor_fabrics_all = np.empty(
+                (num_rows, self.competition_top_k), dtype=np.int64
+            )
+            neighbor_img_paths_all = [None] * num_rows
+            neighbor_scores_all = np.empty(
+                (num_rows, self.competition_top_k), dtype=np.float32
+            )
+            neighbor_mask_all = np.empty(
+                (num_rows, self.competition_top_k), dtype=np.float32
+            )
 
-        for _, row in tqdm(data.iterrows(), total=len(data), ascii=True):
-            cat = row["category"]
-            col = row["color"]
-            fab = row["fabric"]
-            start_date = pd.Timestamp(row["release_date"])
-            img_path = row["image_path"]
+        iterator = data.itertuples(index=False, name="Row")
+        for i, row in enumerate(tqdm(iterator, total=num_rows, ascii=True)):
+            cat_gtrend = self._get_scaled_gtrend(row.category, row.release_date)
+            col_gtrend = self._get_scaled_gtrend(row.color, row.release_date)
+            fab_gtrend = self._get_scaled_gtrend(row.fabric, row.release_date)
 
-            cat_gtrend = self._get_scaled_gtrend(cat, start_date)
-            col_gtrend = self._get_scaled_gtrend(col, start_date)
-            fab_gtrend = self._get_scaled_gtrend(fab, start_date)
-
-            multitrends.append(np.vstack([cat_gtrend, col_gtrend, fab_gtrend]))
-            image_paths.append(img_path)
+            multitrends[i] = np.stack([cat_gtrend, col_gtrend, fab_gtrend], axis=0)
+            image_paths[i] = row.image_path
 
             if self.use_competition_extension:
                 (
@@ -393,14 +458,41 @@ class ZeroShotDataset:
                     n_scores,
                     n_mask,
                 ) = self._build_competition_snapshot(row)
-                neighbor_categories_all.append(n_cat)
-                neighbor_colors_all.append(n_col)
-                neighbor_fabrics_all.append(n_fab)
-                neighbor_img_paths_all.append(n_img_paths)
-                neighbor_scores_all.append(n_scores)
-                neighbor_mask_all.append(n_mask)
 
-        multitrends = torch.FloatTensor(np.asarray(multitrends, dtype=np.float32))
+                neighbor_categories_all[i] = n_cat
+                neighbor_colors_all[i] = n_col
+                neighbor_fabrics_all[i] = n_fab
+                neighbor_img_paths_all[i] = n_img_paths
+                neighbor_scores_all[i] = n_scores
+                neighbor_mask_all[i] = n_mask
+
+        multitrends = torch.from_numpy(multitrends)
+
+        category_values = data["category"].to_numpy()
+        color_values = data["color"].to_numpy()
+        fabric_values = data["fabric"].to_numpy()
+
+        categories = torch.from_numpy(
+            np.fromiter(
+                (self.cat_dict[val] for val in category_values),
+                dtype=np.int64,
+                count=num_rows,
+            )
+        )
+        colors = torch.from_numpy(
+            np.fromiter(
+                (self.col_dict[val] for val in color_values),
+                dtype=np.int64,
+                count=num_rows,
+            )
+        )
+        fabrics = torch.from_numpy(
+            np.fromiter(
+                (self.fab_dict[val] for val in fabric_values),
+                dtype=np.int64,
+                count=num_rows,
+            )
+        )
 
         data = data.drop(
             ["external_code", "season", "release_date", "image_path"],
@@ -410,9 +502,6 @@ class ZeroShotDataset:
 
         item_sales = self._get_sales_tensor(data)
         temporal_features = self._extract_temporal_features(data)
-        categories = torch.LongTensor([self.cat_dict[val] for val in data["category"].values])
-        colors = torch.LongTensor([self.col_dict[val] for val in data["color"].values])
-        fabrics = torch.LongTensor([self.fab_dict[val] for val in data["fabric"].values])
 
         if not self.use_competition_extension:
             return LazyDataset(
@@ -435,28 +524,32 @@ class ZeroShotDataset:
             gtrends=multitrends,
             img_paths=image_paths,
             img_root=self.img_root,
-            neighbor_categories=torch.LongTensor(np.asarray(neighbor_categories_all)),
-            neighbor_colors=torch.LongTensor(np.asarray(neighbor_colors_all)),
-            neighbor_fabrics=torch.LongTensor(np.asarray(neighbor_fabrics_all)),
+            neighbor_categories=torch.from_numpy(neighbor_categories_all),
+            neighbor_colors=torch.from_numpy(neighbor_colors_all),
+            neighbor_fabrics=torch.from_numpy(neighbor_fabrics_all),
             neighbor_img_paths=neighbor_img_paths_all,
-            neighbor_scores=torch.FloatTensor(np.asarray(neighbor_scores_all)),
-            neighbor_mask=torch.FloatTensor(np.asarray(neighbor_mask_all)),
+            neighbor_scores=torch.from_numpy(neighbor_scores_all),
+            neighbor_mask=torch.from_numpy(neighbor_mask_all),
         )
 
     def get_loader(self, batch_size, train=True):
         print("Starting dataset creation process...")
         data_with_gtrends = self.preprocess_data()
 
-        if train:
-            return DataLoader(
-                data_with_gtrends,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=2,
-            )
-        return DataLoader(
-            data_with_gtrends,
-            batch_size=1,
-            shuffle=False,
-            num_workers=2,
-        )
+        cpu_count = os.cpu_count() or 0
+        num_workers = min(8, cpu_count)
+        pin_memory = torch.cuda.is_available()
+
+        loader_kwargs = {
+            "dataset": data_with_gtrends,
+            "batch_size": batch_size,
+            "shuffle": train,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+        }
+
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 2
+
+        return DataLoader(**loader_kwargs)

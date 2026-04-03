@@ -1,12 +1,13 @@
 import copy
 import math
+from collections import OrderedDict
 
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
 from torchvision import models
-from transformers import pipeline
+from transformers import AutoModel, AutoTokenizer
 
 
 def compute_forecast_metrics(
@@ -34,9 +35,10 @@ def compute_forecast_metrics(
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=52):
+    def __init__(self, d_model, dropout=0.1, max_len=52, batch_first=True):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
+        self.batch_first = batch_first
 
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
@@ -45,11 +47,13 @@ class PositionalEncoding(nn.Module):
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(1)
-        self.register_buffer("pe", pe)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
 
     def forward(self, x):
-        x = x + self.pe[: x.size(0)]
+        if self.batch_first:
+            x = x + self.pe[:, : x.size(1)]
+        else:
+            x = x + self.pe[:, : x.size(0)].transpose(0, 1)
         return self.dropout(x)
 
 
@@ -62,7 +66,7 @@ class TimeDistributed(nn.Module):
         self.batch_first = batch_first
 
     def forward(self, x):
-        if len(x.size()) <= 2:
+        if x.dim() <= 2:
             return self.module(x)
 
         x_reshape = x.contiguous().view(-1, x.size(-1))
@@ -76,7 +80,6 @@ class TimeDistributed(nn.Module):
 class FusionNetwork(nn.Module):
     def __init__(self, embedding_dim, hidden_dim, use_img, use_text, dropout=0.2):
         super().__init__()
-        self.img_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.img_linear = nn.Linear(2048, embedding_dim)
         self.use_img = use_img
         self.use_text = use_text
@@ -90,13 +93,10 @@ class FusionNetwork(nn.Module):
             nn.Linear(input_dim, hidden_dim),
         )
 
-    def forward(self, img_encoding, text_encoding, dummy_encoding):
-        pooled_img = self.img_pool(img_encoding)
-        condensed_img = self.img_linear(pooled_img.flatten(1))
-
+    def forward(self, img_features, text_encoding, dummy_encoding):
         decoder_inputs = []
         if self.use_img == 1:
-            decoder_inputs.append(condensed_img)
+            decoder_inputs.append(self.img_linear(img_features))
         if self.use_text == 1:
             decoder_inputs.append(text_encoding)
         decoder_inputs.append(dummy_encoding)
@@ -115,7 +115,6 @@ class MultimodalProductEncoder(nn.Module):
 
     def __init__(self, embedding_dim, hidden_dim, use_img, use_text, dropout=0.2):
         super().__init__()
-        self.img_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.img_linear = nn.Linear(2048, embedding_dim)
         self.use_img = use_img
         self.use_text = use_text
@@ -132,12 +131,10 @@ class MultimodalProductEncoder(nn.Module):
             nn.Linear(input_dim, hidden_dim),
         )
 
-    def forward(self, img_encoding, text_encoding):
+    def forward(self, img_features, text_encoding):
         features = []
         if self.use_img == 1:
-            pooled_img = self.img_pool(img_encoding)
-            condensed_img = self.img_linear(pooled_img.flatten(1))
-            features.append(condensed_img)
+            features.append(self.img_linear(img_features))
         if self.use_text == 1:
             features.append(text_encoding)
 
@@ -149,65 +146,128 @@ class GTrendEmbedder(nn.Module):
     def __init__(self, forecast_horizon, embedding_dim, use_mask, trend_len, num_trends):
         super().__init__()
         self.forecast_horizon = forecast_horizon
-        self.input_linear = TimeDistributed(nn.Linear(num_trends, embedding_dim))
-        self.pos_embedding = PositionalEncoding(embedding_dim, max_len=trend_len)
+        self.input_linear = TimeDistributed(nn.Linear(num_trends, embedding_dim), batch_first=True)
+        self.pos_embedding = PositionalEncoding(embedding_dim, max_len=trend_len, batch_first=True)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embedding_dim,
             nhead=4,
             dropout=0.2,
+            batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
         self.use_mask = use_mask
+        self._mask_cache = {}
 
     def _generate_encoder_mask(self, size, forecast_horizon, device):
+        cache_key = (size, forecast_horizon, str(device))
+        if cache_key in self._mask_cache:
+            return self._mask_cache[cache_key]
+
         mask = torch.zeros((size, size), device=device)
         split = math.gcd(size, forecast_horizon)
         for i in range(0, size, split):
             mask[i : i + split, i : i + split] = 1
         mask = mask.float().masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, 0.0)
+        self._mask_cache[cache_key] = mask
         return mask
 
     def forward(self, gtrends):
+        # [B, num_trends, trend_len] -> [B, trend_len, num_trends]
         gtrend_emb = self.input_linear(gtrends.permute(0, 2, 1))
-        gtrend_emb = self.pos_embedding(gtrend_emb.permute(1, 0, 2))
+        gtrend_emb = self.pos_embedding(gtrend_emb)
 
         if self.use_mask == 1:
             input_mask = self._generate_encoder_mask(
-                gtrend_emb.shape[0],
+                gtrend_emb.shape[1],
                 self.forecast_horizon,
                 device=gtrend_emb.device,
             )
-            gtrend_emb = self.encoder(gtrend_emb, input_mask)
-        else:
-            gtrend_emb = self.encoder(gtrend_emb)
+            return self.encoder(gtrend_emb, mask=input_mask)
 
-        return gtrend_emb
+        return self.encoder(gtrend_emb)
 
 
 class TextEmbedder(nn.Module):
-    def __init__(self, embedding_dim, cat_dict, col_dict, fab_dict):
+    def __init__(
+        self,
+        embedding_dim,
+        cat_dict,
+        col_dict,
+        fab_dict,
+        bert_model_name="bert-base-uncased",
+        max_cache_size=4096,
+    ):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.cat_dict = {v: k for k, v in cat_dict.items()}
         self.col_dict = {v: k for k, v in col_dict.items()}
         self.fab_dict = {v: k for k, v in fab_dict.items()}
-        self.word_embedder = pipeline("feature-extraction", model="bert-base-uncased")
-        self.fc = nn.Linear(768, embedding_dim)
-        self.dropout = nn.Dropout(0.1)
 
-    def forward(self, category, color, fabric):
-        textual_description = [
-            self.col_dict[color.detach().cpu().numpy().tolist()[i]]
-            + " "
-            + self.fab_dict[fabric.detach().cpu().numpy().tolist()[i]]
-            + " "
-            + self.cat_dict[category.detach().cpu().numpy().tolist()[i]]
-            for i in range(len(category))
+        self.tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
+        self.bert = AutoModel.from_pretrained(bert_model_name)
+        self.bert.eval()
+        for p in self.bert.parameters():
+            p.requires_grad = False
+
+        self.fc = nn.Linear(self.bert.config.hidden_size, embedding_dim)
+        self.dropout = nn.Dropout(0.1)
+        self.max_cache_size = max_cache_size
+        self._embedding_cache = OrderedDict()
+
+    def _evict_if_needed(self):
+        while len(self._embedding_cache) > self.max_cache_size:
+            self._embedding_cache.popitem(last=False)
+
+    def _build_descriptions(self, category, color, fabric):
+        category_ids = category.detach().cpu().tolist()
+        color_ids = color.detach().cpu().tolist()
+        fabric_ids = fabric.detach().cpu().tolist()
+
+        return [
+            f"{self.col_dict[col]} {self.fab_dict[fab]} {self.cat_dict[cat]}"
+            for cat, col, fab in zip(category_ids, color_ids, fabric_ids)
         ]
 
-        word_embeddings = self.word_embedder(textual_description)
-        word_embeddings = [torch.FloatTensor(x[1:-1]).mean(axis=0) for x in word_embeddings]
-        word_embeddings = torch.stack(word_embeddings).to(category.device)
+    def _mean_pool(self, hidden_state, attention_mask, special_tokens_mask=None):
+        mask = attention_mask.clone()
+        if special_tokens_mask is not None:
+            mask = mask * (1 - special_tokens_mask)
+        mask = mask.unsqueeze(-1).type_as(hidden_state)
+        masked_hidden = hidden_state * mask
+        summed = masked_hidden.sum(dim=1)
+        counts = mask.sum(dim=1).clamp(min=1e-6)
+        return summed / counts
+
+    def _encode_missing_descriptions(self, missing_descriptions, device):
+        if not missing_descriptions:
+            return
+
+        encoded = self.tokenizer(
+            missing_descriptions,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            return_special_tokens_mask=True,
+        )
+        encoded = {k: v.to(device) for k, v in encoded.items()}
+
+        with torch.no_grad():
+            special_tokens_mask = encoded.pop("special_tokens_mask")
+            hidden = self.bert(**encoded).last_hidden_state
+            pooled = self._mean_pool(hidden, encoded["attention_mask"], special_tokens_mask)
+
+        pooled_cpu = pooled.detach().cpu()
+        for description, embedding in zip(missing_descriptions, pooled_cpu):
+            self._embedding_cache[description] = embedding
+        self._evict_if_needed()
+
+    def forward(self, category, color, fabric):
+        descriptions = self._build_descriptions(category, color, fabric)
+        missing = [d for d in descriptions if d not in self._embedding_cache]
+        self._encode_missing_descriptions(missing, category.device)
+
+        cached_embeddings = [self._embedding_cache[d] for d in descriptions]
+        word_embeddings = torch.stack(cached_embeddings, dim=0).to(category.device)
         word_embeddings = self.dropout(self.fc(word_embeddings))
         return word_embeddings
 
@@ -220,16 +280,15 @@ class ImageEmbedder(nn.Module):
         except Exception:
             resnet = models.resnet50(pretrained=True)
 
-        modules = list(resnet.children())[:-2]
+        modules = list(resnet.children())[:-1]
         self.resnet = nn.Sequential(*modules)
         for p in self.resnet.parameters():
             p.requires_grad = False
 
     def forward(self, images):
-        img_embeddings = self.resnet(images)
-        size = img_embeddings.size()
-        out = img_embeddings.view(*size[:2], -1)
-        return out.view(*size).contiguous()
+        with torch.no_grad():
+            img_embeddings = self.resnet(images)
+        return img_embeddings.flatten(1)
 
 
 class DummyEmbedder(nn.Module):
@@ -263,7 +322,12 @@ class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.multihead_attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -274,18 +338,18 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout3 = nn.Dropout(dropout)
 
     def forward(self, tgt, memory, tgt_mask=None, memory_mask=None):
+        del tgt_mask  # not used in this lightweight decoder implementation
         tgt2, attn_weights = self.multihead_attn(
             tgt,
             memory,
             memory,
             attn_mask=memory_mask,
+            need_weights=True,
         )
-        tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
+        tgt = self.norm2(tgt + self.dropout2(tgt2))
 
         tgt2 = self.linear2(self.dropout(F.relu(self.linear1(tgt))))
-        tgt = tgt + self.dropout3(tgt2)
-        tgt = self.norm3(tgt)
+        tgt = self.norm3(tgt + self.dropout3(tgt2))
 
         return tgt, attn_weights
 
@@ -340,6 +404,7 @@ class GTM(pl.LightningModule):
         self.gpu_num = gpu_num
         self.use_competition_extension = bool(use_competition_extension)
         self.competition_top_k = competition_top_k
+        self._decoder_mask_cache = {}
 
         self.save_hyperparameters()
         self.validation_outputs = []
@@ -369,7 +434,7 @@ class GTM(pl.LightningModule):
             dropout=0.1,
         )
         if self.autoregressive:
-            self.pos_encoder = PositionalEncoding(hidden_dim, max_len=output_dim)
+            self.pos_encoder = PositionalEncoding(hidden_dim, max_len=output_dim, batch_first=True)
         self.decoder = SimpleTransformerDecoder(decoder_layer, num_layers)
 
         self.decoder_fc = nn.Sequential(
@@ -395,15 +460,20 @@ class GTM(pl.LightningModule):
         )
 
     def _generate_square_subsequent_mask(self, size, device):
-        mask = (torch.triu(torch.ones(size, size, device=device)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, 0.0)
+        cache_key = (size, str(device))
+        if cache_key in self._decoder_mask_cache:
+            return self._decoder_mask_cache[cache_key]
+
+        mask = torch.triu(torch.ones(size, size, device=device), diagonal=1)
+        mask = mask.masked_fill(mask == 1, float("-inf"))
+        self._decoder_mask_cache[cache_key] = mask
         return mask
 
     def encode_multimodal_embedding(self, category, color, fabric, images):
         """Compute h_i using only image and textual metadata."""
-        img_encoding = self.image_encoder(images)
+        img_features = self.image_encoder(images)
         text_encoding = self.text_encoder(category, color, fabric)
-        x_i = self.multimodal_product_encoder(img_encoding, text_encoding)
+        x_i = self.multimodal_product_encoder(img_features, text_encoding)
         return x_i
 
     def _build_launch_week_competition_context(
@@ -436,14 +506,14 @@ class GTM(pl.LightningModule):
             neighbor_images.size(-1),
         )
 
-        neighbor_img_encoding = self.image_encoder(flat_neighbor_images)
+        neighbor_img_features = self.image_encoder(flat_neighbor_images)
         neighbor_text_encoding = self.text_encoder(
             flat_neighbor_categories,
             flat_neighbor_colors,
             flat_neighbor_fabrics,
         )
         neighbor_repr = self.multimodal_product_encoder(
-            neighbor_img_encoding,
+            neighbor_img_features,
             neighbor_text_encoding,
         ).reshape(batch_size, top_k, self.hidden_dim)
 
@@ -467,7 +537,7 @@ class GTM(pl.LightningModule):
         z_bar = self.comp_mlp(
             torch.cat([static_feature_fusion, c_negative, c_positive], dim=-1)
         )
-        z_bar_sequence = z_bar.unsqueeze(1).repeat(1, self.output_len, 1)
+        z_bar_sequence = z_bar.unsqueeze(1).expand(-1, self.output_len, -1)
 
         diagnostics = {
             "signed_weights": signed_weights.detach(),
@@ -491,16 +561,16 @@ class GTM(pl.LightningModule):
         neighbor_scores=None,
         neighbor_mask=None,
     ):
-        img_encoding = self.image_encoder(images)
+        img_features = self.image_encoder(images)
         dummy_encoding = self.dummy_encoder(temporal_features)
         text_encoding = self.text_encoder(category, color, fabric)
         gtrend_encoding = self.gtrend_encoder(gtrends)
         static_feature_fusion = self.static_feature_encoder(
-            img_encoding,
+            img_features,
             text_encoding,
             dummy_encoding,
         )
-        target_product_repr = self.multimodal_product_encoder(img_encoding, text_encoding)
+        target_product_repr = self.multimodal_product_encoder(img_features, text_encoding)
 
         competition_enabled = (
             self.use_competition_extension
@@ -526,39 +596,35 @@ class GTM(pl.LightningModule):
                 neighbor_mask=neighbor_mask,
             )
 
-            tgt = z_bar_sequence.permute(1, 0, 2)
-            memory = gtrend_encoding
-            decoder_out, attn_weights = self.decoder(tgt, memory)
-            forecast = self.decoder_step_fc(decoder_out).squeeze(-1).transpose(0, 1)
+            decoder_out, attn_weights = self.decoder(z_bar_sequence, gtrend_encoding)
+            forecast = self.decoder_step_fc(decoder_out).squeeze(-1)
             return forecast, attn_weights, diagnostics
 
         if self.autoregressive == 1:
             tgt = torch.zeros(
+                gtrend_encoding.shape[0],
                 self.output_len,
-                gtrend_encoding.shape[1],
                 gtrend_encoding.shape[-1],
                 device=gtrend_encoding.device,
             )
-            tgt[0] = static_feature_fusion
+            tgt[:, 0, :] = static_feature_fusion
             tgt = self.pos_encoder(tgt)
             tgt_mask = self._generate_square_subsequent_mask(
                 self.output_len,
                 device=gtrend_encoding.device,
             )
-            memory = gtrend_encoding
-            decoder_out, attn_weights = self.decoder(tgt, memory, tgt_mask=tgt_mask)
-            forecast = self.decoder_fc(decoder_out).squeeze(-1).transpose(0, 1)
+            decoder_out, attn_weights = self.decoder(tgt, gtrend_encoding, tgt_mask=tgt_mask)
+            forecast = self.decoder_fc(decoder_out).squeeze(-1)
         else:
-            tgt = static_feature_fusion.unsqueeze(0)
-            memory = gtrend_encoding
-            decoder_out, attn_weights = self.decoder(tgt, memory)
-            forecast = self.decoder_fc(decoder_out).squeeze(0)
+            tgt = static_feature_fusion.unsqueeze(1)
+            decoder_out, attn_weights = self.decoder(tgt, gtrend_encoding)
+            forecast = self.decoder_fc(decoder_out).squeeze(1)
 
         return forecast.view(-1, self.output_len), attn_weights, None
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3)
-        return [optimizer]
+        return optimizer
 
     def _forward_from_batch(self, batch):
         if len(batch) == 7:
@@ -606,17 +672,19 @@ class GTM(pl.LightningModule):
         return item_sales, forecasted_sales
 
     def training_step(self, train_batch, batch_idx):
+        del batch_idx
         item_sales, forecasted_sales = self._forward_from_batch(train_batch)
-        loss = F.mse_loss(item_sales, forecasted_sales.squeeze())
-        self.log("train_loss", loss)
+        loss = F.mse_loss(item_sales, forecasted_sales)
+        self.log("train_loss", loss, prog_bar=True, batch_size=item_sales.size(0))
         return loss
 
     def validation_step(self, val_batch, batch_idx):
+        del batch_idx
         item_sales, forecasted_sales = self._forward_from_batch(val_batch)
         self.validation_outputs.append(
             {
-                "item_sales": item_sales.squeeze(),
-                "forecasted_sales": forecasted_sales.squeeze(),
+                "item_sales": item_sales.detach().view(item_sales.size(0), -1).cpu(),
+                "forecasted_sales": forecasted_sales.detach().view(forecasted_sales.size(0), -1).cpu(),
             }
         )
 
@@ -627,12 +695,13 @@ class GTM(pl.LightningModule):
         if len(self.validation_outputs) == 0:
             return
 
-        item_sales = torch.stack([x["item_sales"] for x in self.validation_outputs])
-        forecasted_sales = torch.stack(
-            [x["forecasted_sales"] for x in self.validation_outputs]
+        item_sales = torch.cat([x["item_sales"] for x in self.validation_outputs], dim=0)
+        forecasted_sales = torch.cat(
+            [x["forecasted_sales"] for x in self.validation_outputs],
+            dim=0,
         )
 
-        loss = F.mse_loss(item_sales, forecasted_sales.squeeze())
+        loss = F.mse_loss(item_sales, forecasted_sales)
 
         rescaled_item_sales = item_sales * 1065
         rescaled_forecasted_sales = forecasted_sales * 1065
