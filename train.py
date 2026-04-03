@@ -200,7 +200,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=21)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--gpu_num", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=16)
 
     # model
     parser.add_argument("--model_type", type=str, default="GTM", help="Choose between GTM or FCN")
@@ -221,7 +221,7 @@ if __name__ == "__main__":
 
     # competition extension
     parser.add_argument("--use_competition_extension", type=int, default=0)
-    parser.add_argument("--competition_top_k", type=int, default=10)
+    parser.add_argument("--competition_top_k", type=int, default=4)
     parser.add_argument(
         "--competition_topk_indices_path",
         type=str,
