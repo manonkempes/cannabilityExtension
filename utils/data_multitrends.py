@@ -196,6 +196,11 @@ class ZeroShotDataset:
         col_dict,
         fab_dict,
         trend_len,
+        target_cols=None,
+        temporal_cols=None,
+        text_cols=None,
+        trend_cols=None,
+        image_col="image_path",
         use_competition_extension=False,
         competition_reference_df=None,
         competition_topk_indices_path=None,
@@ -209,11 +214,18 @@ class ZeroShotDataset:
         self.cat_dict = cat_dict
         self.col_dict = col_dict
         self.fab_dict = fab_dict
-        self.trend_len = trend_len
+        self.trend_len = int(trend_len)
         self.img_root = str(img_root)
 
+        # Defaults aangepast op jouw kolommen
+        self.target_cols = target_cols or [str(i) for i in range(12)]
+        self.temporal_cols = temporal_cols or ["day", "week", "month", "year"]
+        self.text_cols = text_cols or ["category", "color", "fabric"]
+        self.trend_cols = trend_cols or ["category", "color", "fabric"]
+        self.image_col = image_col
+
         self.use_competition_extension = bool(use_competition_extension)
-        self.competition_top_k = competition_top_k
+        self.competition_top_k = int(competition_top_k)
 
         self.competition_reference_df = None
         self.topk_indices = None
@@ -228,6 +240,12 @@ class ZeroShotDataset:
 
         self._gtrend_cache = {}
         self._competition_snapshot_cache = {}
+
+        if len(self.text_cols) != 3:
+            raise ValueError("text_cols must contain exactly 3 columns: [category, color, fabric]")
+
+        if len(self.trend_cols) != 3:
+            raise ValueError("trend_cols must contain exactly 3 columns: [category, color, fabric]")
 
         if self.use_competition_extension:
             if competition_reference_df is None:
@@ -254,6 +272,29 @@ class ZeroShotDataset:
                 competition_meta_path=competition_meta_path,
             )
 
+    def _resolve_single_column(self, data: pd.DataFrame, col_name):
+        """
+        Resolve column names robustly for cases where 0..11 may appear as strings
+        or integers, depending on how the DataFrame was loaded.
+        """
+        if col_name in data.columns:
+            return col_name
+
+        if isinstance(col_name, str) and col_name.isdigit():
+            as_int = int(col_name)
+            if as_int in data.columns:
+                return as_int
+
+        if isinstance(col_name, int):
+            as_str = str(col_name)
+            if as_str in data.columns:
+                return as_str
+
+        raise ValueError(f"Missing column: {col_name}")
+
+    def _resolve_columns(self, data: pd.DataFrame, columns):
+        return [self._resolve_single_column(data, c) for c in columns]
+
     def _load_competition_artifacts(
         self,
         competition_topk_indices_path,
@@ -279,6 +320,8 @@ class ZeroShotDataset:
         reference_df["external_code"] = reference_df["external_code"].astype(str)
         reference_df = reference_df.set_index("external_code")
 
+        cat_text_col, color_text_col, fabric_text_col = self.text_cols
+
         num_products = len(row_mapping)
         self.reference_category_ids = np.zeros(num_products, dtype=np.int64)
         self.reference_color_ids = np.zeros(num_products, dtype=np.int64)
@@ -292,10 +335,10 @@ class ZeroShotDataset:
                 )
 
             row = reference_df.loc[code]
-            self.reference_category_ids[idx] = self.cat_dict[row["category"]]
-            self.reference_color_ids[idx] = self.col_dict[row["color"]]
-            self.reference_fabric_ids[idx] = self.fab_dict[row["fabric"]]
-            self.reference_image_paths[idx] = row["image_path"]
+            self.reference_category_ids[idx] = self.cat_dict[str(row[cat_text_col])]
+            self.reference_color_ids[idx] = self.col_dict[str(row[color_text_col])]
+            self.reference_fabric_ids[idx] = self.fab_dict[str(row[fabric_text_col])]
+            self.reference_image_paths[idx] = str(row[self.image_col])
 
         expected_shape = (len(week_columns), num_products)
         if self.topk_indices.shape[:2] != expected_shape:
@@ -304,29 +347,14 @@ class ZeroShotDataset:
                 f"Expected {expected_shape}, got {self.topk_indices.shape[:2]}."
             )
 
-    def _extract_temporal_features(self, data: pd.DataFrame) -> torch.FloatTensor:
-        """
-        Extract the four temporal features used by the baseline model.
-
-        If the named columns are present, use them explicitly.
-        Otherwise, fall back to the original positional slicing.
-        """
-        expected_cols = ["day", "week", "month", "year"]
-        if all(col in data.columns for col in expected_cols):
-            arr = data[expected_cols].to_numpy(dtype=np.float32, copy=True)
-            return torch.from_numpy(arr)
-
-        arr = data.iloc[:, 13:17].to_numpy(dtype=np.float32, copy=True)
+    def _extract_temporal_features(self, data: pd.DataFrame, temporal_cols=None) -> torch.FloatTensor:
+        cols = temporal_cols or self._resolve_columns(data, self.temporal_cols)
+        arr = data[cols].to_numpy(dtype=np.float32, copy=True)
         return torch.from_numpy(arr)
 
-    def _get_sales_tensor(self, data: pd.DataFrame) -> torch.FloatTensor:
-        """
-        Return the 12-week target horizon.
-
-        The original repository takes the first 12 columns as the target horizon,
-        so the same assumption is preserved here.
-        """
-        arr = data.iloc[:, :12].to_numpy(dtype=np.float32, copy=True)
+    def _get_sales_tensor(self, data: pd.DataFrame, target_cols=None) -> torch.FloatTensor:
+        cols = target_cols or self._resolve_columns(data, self.target_cols)
+        arr = data[cols].to_numpy(dtype=np.float32, copy=True)
         return torch.from_numpy(arr)
 
     def _get_scaled_gtrend(self, label: str, start_date: pd.Timestamp) -> np.ndarray:
@@ -335,15 +363,16 @@ class ZeroShotDataset:
 
         The series is padded with zeros if it is shorter than trend_len.
         """
+        label = str(label)
         start_date = pd.Timestamp(start_date).normalize()
         cache_key = (label, start_date)
 
         if cache_key in self._gtrend_cache:
             return self._gtrend_cache[cache_key]
 
-        gtrend_start = start_date - pd.DateOffset(weeks=52)
+        gtrend_start = start_date - pd.DateOffset(weeks=self.trend_len)
         try:
-            series = self.gtrends.loc[gtrend_start:start_date, label].values[-52:]
+            series = self.gtrends.loc[gtrend_start:start_date, label].values[-self.trend_len :]
         except KeyError:
             series = np.zeros(self.trend_len, dtype=np.float32)
 
@@ -361,9 +390,6 @@ class ZeroShotDataset:
     def _build_competition_snapshot(self, row):
         """
         Build the launch-week Top-K neighborhood for one target product.
-
-        This first integration uses the launch week as the assortment snapshot
-        to stay compatible with the current GTM decoder.
         """
         target_code = str(row.external_code)
         launch_week_label = floor_to_monday(pd.Timestamp(row.release_date)).strftime("%Y-%m-%d")
@@ -419,35 +445,49 @@ class ZeroShotDataset:
         data = self.data_df.copy()
         num_rows = len(data)
 
+        target_cols = self._resolve_columns(data, self.target_cols)
+        temporal_cols = self._resolve_columns(data, self.temporal_cols)
+        text_cols = self._resolve_columns(data, self.text_cols)
+        trend_cols = self._resolve_columns(data, self.trend_cols)
+        image_col = self._resolve_single_column(data, self.image_col)
+        release_date_col = self._resolve_single_column(data, "release_date")
+
+        cat_text_col, color_text_col, fabric_text_col = text_cols
+        cat_trend_col, color_trend_col, fabric_trend_col = trend_cols
+
         multitrends = np.empty((num_rows, 3, self.trend_len), dtype=np.float32)
         image_paths = [""] * num_rows
 
         if self.use_competition_extension:
-            neighbor_categories_all = np.empty(
-                (num_rows, self.competition_top_k), dtype=np.int64
-            )
-            neighbor_colors_all = np.empty(
-                (num_rows, self.competition_top_k), dtype=np.int64
-            )
-            neighbor_fabrics_all = np.empty(
-                (num_rows, self.competition_top_k), dtype=np.int64
-            )
+            external_code_col = self._resolve_single_column(data, "external_code")
+            _ = external_code_col  # alleen om te valideren dat hij bestaat
+
+            neighbor_categories_all = np.empty((num_rows, self.competition_top_k), dtype=np.int64)
+            neighbor_colors_all = np.empty((num_rows, self.competition_top_k), dtype=np.int64)
+            neighbor_fabrics_all = np.empty((num_rows, self.competition_top_k), dtype=np.int64)
             neighbor_img_paths_all = [None] * num_rows
-            neighbor_scores_all = np.empty(
-                (num_rows, self.competition_top_k), dtype=np.float32
-            )
-            neighbor_mask_all = np.empty(
-                (num_rows, self.competition_top_k), dtype=np.float32
-            )
+            neighbor_scores_all = np.empty((num_rows, self.competition_top_k), dtype=np.float32)
+            neighbor_mask_all = np.empty((num_rows, self.competition_top_k), dtype=np.float32)
 
         iterator = data.itertuples(index=False, name="Row")
         for i, row in enumerate(tqdm(iterator, total=num_rows, ascii=True)):
-            cat_gtrend = self._get_scaled_gtrend(row.category, row.release_date)
-            col_gtrend = self._get_scaled_gtrend(row.color, row.release_date)
-            fab_gtrend = self._get_scaled_gtrend(row.fabric, row.release_date)
+            row_dict = row._asdict()
+
+            cat_gtrend = self._get_scaled_gtrend(
+                row_dict[cat_trend_col],
+                row_dict[release_date_col],
+            )
+            col_gtrend = self._get_scaled_gtrend(
+                row_dict[color_trend_col],
+                row_dict[release_date_col],
+            )
+            fab_gtrend = self._get_scaled_gtrend(
+                row_dict[fabric_trend_col],
+                row_dict[release_date_col],
+            )
 
             multitrends[i] = np.stack([cat_gtrend, col_gtrend, fab_gtrend], axis=0)
-            image_paths[i] = row.image_path
+            image_paths[i] = str(row_dict[image_col])
 
             if self.use_competition_extension:
                 (
@@ -468,9 +508,9 @@ class ZeroShotDataset:
 
         multitrends = torch.from_numpy(multitrends)
 
-        category_values = data["category"].to_numpy()
-        color_values = data["color"].to_numpy()
-        fabric_values = data["fabric"].to_numpy()
+        category_values = data[cat_text_col].astype(str).to_numpy()
+        color_values = data[color_text_col].astype(str).to_numpy()
+        fabric_values = data[fabric_text_col].astype(str).to_numpy()
 
         categories = torch.from_numpy(
             np.fromiter(
@@ -494,14 +534,8 @@ class ZeroShotDataset:
             )
         )
 
-        data = data.drop(
-            ["external_code", "season", "release_date", "image_path"],
-            axis=1,
-            errors="ignore",
-        )
-
-        item_sales = self._get_sales_tensor(data)
-        temporal_features = self._extract_temporal_features(data)
+        item_sales = self._get_sales_tensor(data, target_cols=target_cols)
+        temporal_features = self._extract_temporal_features(data, temporal_cols=temporal_cols)
 
         if not self.use_competition_extension:
             return LazyDataset(

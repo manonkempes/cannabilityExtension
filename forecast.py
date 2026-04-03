@@ -48,6 +48,11 @@ def build_test_loader(test_df, args, gtrends, cat_dict, col_dict, fab_dict):
         col_dict=col_dict,
         fab_dict=fab_dict,
         trend_len=args.trend_len,
+        target_cols=args.target_cols,
+        temporal_cols=args.temporal_cols,
+        text_cols=args.text_cols,
+        trend_cols=args.trend_cols,
+        image_col=args.image_col,
         use_competition_extension=use_competition,
         competition_reference_df=test_df if use_competition else None,
         competition_topk_indices_path=args.competition_topk_indices_path if use_competition else None,
@@ -207,7 +212,7 @@ def run(args):
         data_folder / "test.csv",
         parse_dates=["release_date"],
     )
-    item_codes = test_df["external_code"].values
+    item_codes = test_df["external_code"].astype(str).values
 
     cat_dict = torch.load(
         data_folder / "category_labels.pt",
@@ -236,7 +241,10 @@ def run(args):
     model.to(device)
     model.eval()
 
-    model_savename = f"{args.model_type}_{args.wandb_run}_model{args.model_output_dim}_eval{args.eval_horizon}"
+    model_savename = (
+        f"{args.model_type}_{args.wandb_run}_"
+        f"model{args.model_output_dim}_eval{args.eval_horizon}"
+    )
 
     gt = []
     forecasts = []
@@ -304,6 +312,13 @@ if __name__ == "__main__":
     parser.add_argument("--autoregressive", type=int, default=0)
     parser.add_argument("--num_attn_heads", type=int, default=4)
     parser.add_argument("--num_hidden_layers", type=int, default=1)
+
+    # dataset columns
+    parser.add_argument("--target_cols", nargs="+", default=[str(i) for i in range(12)])
+    parser.add_argument("--temporal_cols", nargs="+", default=["day", "week", "month", "year"])
+    parser.add_argument("--text_cols", nargs="+", default=["category", "color", "fabric"])
+    parser.add_argument("--trend_cols", nargs="+", default=["category", "color", "fabric"])
+    parser.add_argument("--image_col", type=str, default="image_path")
 
     parser.add_argument("--use_competition_extension", type=int, default=0)
     parser.add_argument("--competition_top_k", type=int, default=4)

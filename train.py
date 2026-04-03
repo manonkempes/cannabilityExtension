@@ -35,6 +35,11 @@ def build_dataset(
         col_dict=col_dict,
         fab_dict=fab_dict,
         trend_len=args.trend_len,
+        target_cols=args.target_cols,
+        temporal_cols=args.temporal_cols,
+        text_cols=args.text_cols,
+        trend_cols=args.trend_cols,
+        image_col=args.image_col,
         use_competition_extension=use_competition,
         competition_reference_df=full_reference_df if use_competition else None,
         competition_topk_indices_path=args.competition_topk_indices_path if use_competition else None,
@@ -175,10 +180,11 @@ def run(args):
     use_gpu = torch.cuda.is_available()
 
     trainer = pl.Trainer(
-        accelerator="gpu" if use_gpu else "cpu",
+        accelerator="auto",
         devices=1,
+        precision="16-mixed" if use_gpu else 32,
         max_epochs=args.epochs,
-        check_val_every_n_epoch=5,
+        check_val_every_n_epoch=1,
         logger=tb_logger,
         callbacks=[checkpoint_callback, early_stop_callback],
     )
@@ -198,9 +204,9 @@ if __name__ == "__main__":
 
     # training
     parser.add_argument("--seed", type=int, default=21)
-    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--gpu_num", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=32)
 
     # model
     parser.add_argument("--model_type", type=str, default="GTM", help="Choose between GTM or FCN")
@@ -218,6 +224,13 @@ if __name__ == "__main__":
     parser.add_argument("--num_trends", type=int, default=3)
     parser.add_argument("--use_encoder_mask", type=int, default=1)
     parser.add_argument("--autoregressive", type=int, default=0)
+
+    # dataset columns
+    parser.add_argument("--target_cols", nargs="+", default=[str(i) for i in range(12)])
+    parser.add_argument("--temporal_cols", nargs="+", default=["day", "week", "month", "year"])
+    parser.add_argument("--text_cols", nargs="+", default=["category", "color", "fabric"])
+    parser.add_argument("--trend_cols", nargs="+", default=["category", "color", "fabric"])
+    parser.add_argument("--image_col", type=str, default="image_path")
 
     # competition extension
     parser.add_argument("--use_competition_extension", type=int, default=0)
