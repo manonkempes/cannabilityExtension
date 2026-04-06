@@ -606,6 +606,7 @@ class GTM(pl.LightningModule):
                 gtrend_encoding.shape[-1],
                 device=gtrend_encoding.device,
             )
+
             tgt[:, 0, :] = static_feature_fusion
             tgt = self.pos_encoder(tgt)
             tgt_mask = self._generate_square_subsequent_mask(
