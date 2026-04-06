@@ -271,7 +271,7 @@ class ZeroShotDataset:
         competition_meta_path=None,
         competition_top_k=10,
     ):
-        self.data_df = data_df.copy().reset_index(drop=True)
+        self.data_df = data_df.reset_index(drop=True)
         self.gtrends = gtrends
         self.cat_dict = cat_dict
         self.col_dict = col_dict
@@ -326,7 +326,10 @@ class ZeroShotDataset:
                     "All competition paths must be provided when the competition extension is enabled."
                 )
 
-            self.competition_reference_df = competition_reference_df.copy().reset_index(drop=True)
+            self.competition_reference_df = competition_reference_df.reset_index(drop=True)
+            self.competition_reference_df["external_code"] = (
+                self.competition_reference_df["external_code"].astype(str)
+            )
             self._load_competition_artifacts(
                 competition_topk_indices_path=competition_topk_indices_path,
                 competition_topk_values_path=competition_topk_values_path,
@@ -378,9 +381,7 @@ class ZeroShotDataset:
             code: idx for idx, code in enumerate(row_mapping["external_code"].tolist())
         }
 
-        reference_df = self.competition_reference_df.copy()
-        reference_df["external_code"] = reference_df["external_code"].astype(str)
-        reference_df = reference_df.set_index("external_code")
+        reference_df = self.competition_reference_df.set_index("external_code")
 
         cat_text_col, color_text_col, fabric_text_col = self.text_cols
 
@@ -504,7 +505,7 @@ class ZeroShotDataset:
         return result
 
     def preprocess_payload(self):
-        data = self.data_df.copy()
+        data = self.data_df
         num_rows = len(data)
 
         target_cols = self._resolve_columns(data, self.target_cols)
@@ -640,7 +641,6 @@ class ZeroShotDataset:
         )
 
     def preprocess_data(self):
-        img_tensor_root = self.img_tensor_root,
         payload = self.preprocess_payload()
         return self._build_dataset_from_payload(payload)
 

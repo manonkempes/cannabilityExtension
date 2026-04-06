@@ -91,8 +91,8 @@ def run(args):
 
     train_df = train_df.sort_values("release_date").reset_index(drop=True)
     val_size = max(1, int(0.15 * len(train_df)))
-    subtrain_df = train_df.iloc[:-val_size].copy()
-    val_df = train_df.iloc[-val_size:].copy()
+    subtrain_df = train_df.iloc[:-val_size]
+    val_df = train_df.iloc[-val_size:]
 
     if args.use_competition_extension and args.model_type != "GTM":
         raise ValueError("The competition extension is implemented only for model_type='GTM'.")

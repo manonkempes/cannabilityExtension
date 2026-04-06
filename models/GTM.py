@@ -407,7 +407,6 @@ class GTM(pl.LightningModule):
         self._decoder_mask_cache = {}
 
         self.save_hyperparameters()
-        self.validation_outputs = []
 
         self.dummy_encoder = DummyEmbedder(embedding_dim)
         self.image_encoder = ImageEmbedder()
@@ -680,42 +679,68 @@ class GTM(pl.LightningModule):
 
     def validation_step(self, val_batch, batch_idx):
         del batch_idx
+
         item_sales, forecasted_sales = self._forward_from_batch(val_batch)
-        self.validation_outputs.append(
-            {
-                "item_sales": item_sales.detach().view(item_sales.size(0), -1).cpu(),
-                "forecasted_sales": forecasted_sales.detach().view(forecasted_sales.size(0), -1).cpu(),
-            }
-        )
+
+        item_sales = item_sales.detach().view(item_sales.size(0), -1)
+        forecasted_sales = forecasted_sales.detach().view(forecasted_sales.size(0), -1)
+
+        abs_err = torch.abs(item_sales - forecasted_sales)
+        sq_err = (item_sales - forecasted_sales) ** 2
+
+        mae_per_series = abs_err.mean(dim=1).clamp(min=1e-12)
+        ts_per_series = (item_sales - forecasted_sales).sum(dim=1) / mae_per_series
+        erp_per_series = (abs_err >= 0.1).float().sum(dim=1)
+
+        scale = 1065.0
+        rescaled_item_sales = item_sales * scale
+        rescaled_abs_err = abs_err * scale
+        erp_per_series_rescaled = (rescaled_abs_err >= 0.1).float().sum(dim=1)
+
+        self.val_sq_err_sum += sq_err.sum()
+        self.val_abs_err_sum += abs_err.sum()
+        self.val_true_sum += item_sales.sum()
+        self.val_ts_sum += ts_per_series.sum()
+        self.val_erp_sum += erp_per_series.sum()
+
+        self.val_abs_err_sum_rescaled += rescaled_abs_err.sum()
+        self.val_true_sum_rescaled += rescaled_item_sales.sum()
+        self.val_erp_sum_rescaled += erp_per_series_rescaled.sum()
+
+        self.val_series_count += item_sales.size(0)
+        self.val_point_count += item_sales.numel()
 
     def on_validation_epoch_start(self):
-        self.validation_outputs = []
+        device = self.device
+
+        self.val_sq_err_sum = torch.tensor(0.0, device=device)
+        self.val_abs_err_sum = torch.tensor(0.0, device=device)
+        self.val_true_sum = torch.tensor(0.0, device=device)
+        self.val_ts_sum = torch.tensor(0.0, device=device)
+        self.val_erp_sum = torch.tensor(0.0, device=device)
+
+        self.val_abs_err_sum_rescaled = torch.tensor(0.0, device=device)
+        self.val_true_sum_rescaled = torch.tensor(0.0, device=device)
+        self.val_erp_sum_rescaled = torch.tensor(0.0, device=device)
+
+        self.val_series_count = 0
+        self.val_point_count = 0
 
     def on_validation_epoch_end(self):
-        if len(self.validation_outputs) == 0:
+        if self.val_series_count == 0 or self.val_point_count == 0:
             return
 
-        item_sales = torch.cat([x["item_sales"] for x in self.validation_outputs], dim=0)
-        forecasted_sales = torch.cat(
-            [x["forecasted_sales"] for x in self.validation_outputs],
-            dim=0,
-        )
+        loss = self.val_sq_err_sum / self.val_point_count
 
-        loss = F.mse_loss(item_sales, forecasted_sales)
+        val_mae_norm = self.val_abs_err_sum / self.val_point_count
+        val_wape_norm = 100.0 * self.val_abs_err_sum / self.val_true_sum.clamp(min=1e-12)
+        val_ts_norm = self.val_ts_sum / self.val_series_count
+        val_erp_norm = self.val_erp_sum / self.val_series_count
 
-        rescaled_item_sales = item_sales * 1065
-        rescaled_forecasted_sales = forecasted_sales * 1065
-
-        val_wape_norm, val_mae_norm, val_ts_norm, val_erp_norm = compute_forecast_metrics(
-            item_sales,
-            forecasted_sales,
-            erp_epsilon=0.1,
-        )
-        val_wape, val_mae, val_ts, val_erp = compute_forecast_metrics(
-            rescaled_item_sales,
-            rescaled_forecasted_sales,
-            erp_epsilon=0.1,
-        )
+        val_mae = self.val_abs_err_sum_rescaled / self.val_point_count
+        val_wape = 100.0 * self.val_abs_err_sum_rescaled / self.val_true_sum_rescaled.clamp(min=1e-12)
+        val_ts = val_ts_norm
+        val_erp = self.val_erp_sum_rescaled / self.val_series_count
 
         self.log("val_loss", loss)
         self.log("val_wape_norm", val_wape_norm, prog_bar=False)
@@ -735,6 +760,7 @@ class GTM(pl.LightningModule):
             f"TS: {val_ts_norm.item():.3f} | "
             f"ERP: {val_erp_norm.item():.3f}"
         )
+
         print(
             f"Validation rescaled | "
             f"WAPE: {val_wape.item():.3f} | "
@@ -742,5 +768,3 @@ class GTM(pl.LightningModule):
             f"TS: {val_ts.item():.3f} | "
             f"ERP: {val_erp.item():.3f}"
         )
-
-        self.validation_outputs.clear()
