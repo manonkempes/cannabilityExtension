@@ -30,6 +30,7 @@ def build_dataset(
     dataset = ZeroShotDataset(
         data_df=data_df,
         img_root=Path(args.data_folder) / "images",
+        img_tensor_root=Path(args.data_folder) / "images_pt",
         gtrends=gtrends,
         cat_dict=cat_dict,
         col_dict=col_dict,
@@ -49,11 +50,13 @@ def build_dataset(
         competition_top_k=args.competition_top_k,
     )
 
+    cache_name = "train_cache.pt" if train_mode else "val_cache.pt"
+
     return dataset.get_loader(
         batch_size=args.batch_size if train_mode else 1,
         train=train_mode,
+        cache_path=Path(args.data_folder) / "cache" / cache_name,
     )
-
 
 def run(args):
     print(args)

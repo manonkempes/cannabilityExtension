@@ -34,6 +34,56 @@ def safe_minmax_scale(values: np.ndarray) -> np.ndarray:
     return ((values - vmin) / (vmax - vmin)).astype(np.float32)
 
 
+def precompute_image_tensors(
+    img_root,
+    img_tensor_root,
+    image_size=(256, 256),
+    use_float16=True,
+):
+    img_root = Path(img_root)
+    img_tensor_root = Path(img_tensor_root)
+    img_tensor_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        resize = Resize(image_size, interpolation=Image.Resampling.BILINEAR)
+    except AttributeError:
+        resize = Resize(image_size)
+
+    transform = Compose(
+        [
+            resize,
+            ToTensor(),
+            Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ]
+    )
+
+    exts = {".jpg", ".jpeg", ".png", ".webp"}
+
+    image_paths = [p for p in img_root.rglob("*") if p.suffix.lower() in exts]
+
+    for img_path in tqdm(image_paths, total=len(image_paths), ascii=True):
+        rel_path = img_path.relative_to(img_root).with_suffix(".pt")
+        out_path = img_tensor_root / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if out_path.exists():
+            continue
+
+        try:
+            with Image.open(img_path) as img:
+                img = img.convert("RGB")
+                tensor = transform(img)
+
+            if use_float16:
+                tensor = tensor.to(torch.float16)
+
+            torch.save(tensor, out_path)
+        except Exception:
+            continue
+
 class LazyDataset(Dataset):
     """
     Load target and neighbor images lazily to keep RAM usage manageable.
@@ -60,22 +110,23 @@ class LazyDataset(Dataset):
     """
 
     def __init__(
-        self,
-        item_sales,
-        categories,
-        colors,
-        fabrics,
-        temporal_features,
-        gtrends,
-        img_paths,
-        img_root,
-        neighbor_categories=None,
-        neighbor_colors=None,
-        neighbor_fabrics=None,
-        neighbor_img_paths=None,
-        neighbor_scores=None,
-        neighbor_mask=None,
-        image_cache_size=4096,
+            self,
+            item_sales,
+            categories,
+            colors,
+            fabrics,
+            temporal_features,
+            gtrends,
+            img_paths,
+            img_root,
+            img_tensor_root=None,
+            neighbor_categories=None,
+            neighbor_colors=None,
+            neighbor_fabrics=None,
+            neighbor_img_paths=None,
+            neighbor_scores=None,
+            neighbor_mask=None,
+            image_cache_size=4096,
     ):
         self.item_sales = item_sales
         self.categories = categories
@@ -85,6 +136,7 @@ class LazyDataset(Dataset):
         self.gtrends = gtrends
         self.img_paths = img_paths
         self.img_root = img_root
+        self.img_tensor_root = str(img_tensor_root) if img_tensor_root is not None else None
 
         self.neighbor_categories = neighbor_categories
         self.neighbor_colors = neighbor_colors
@@ -125,6 +177,15 @@ class LazyDataset(Dataset):
     def _read_image(self, relative_path: str) -> torch.Tensor:
         if relative_path is None or relative_path == "":
             return self.zero_image
+
+        if self.img_tensor_root is not None:
+            tensor_path = Path(self.img_tensor_root) / Path(relative_path).with_suffix(".pt")
+            if tensor_path.exists():
+                try:
+                    tensor = torch.load(tensor_path, map_location="cpu", weights_only=False)
+                    return tensor.float()
+                except Exception:
+                    pass
 
         image_path = os.path.join(self.img_root, relative_path)
         try:
@@ -188,9 +249,10 @@ class LazyDataset(Dataset):
 
 class ZeroShotDataset:
     def __init__(
-        self,
-        data_df,
+            self,
+       data_df,
         img_root,
+        img_tensor_root,
         gtrends,
         cat_dict,
         col_dict,
@@ -216,8 +278,8 @@ class ZeroShotDataset:
         self.fab_dict = fab_dict
         self.trend_len = int(trend_len)
         self.img_root = str(img_root)
+        self.img_tensor_root = str(img_tensor_root) if img_tensor_root is not None else None
 
-        # Defaults aangepast op jouw kolommen
         self.target_cols = target_cols or [str(i) for i in range(12)]
         self.temporal_cols = temporal_cols or ["day", "week", "month", "year"]
         self.text_cols = text_cols or ["category", "color", "fabric"]
@@ -441,7 +503,7 @@ class ZeroShotDataset:
         self._competition_snapshot_cache[cache_key] = result
         return result
 
-    def preprocess_data(self):
+    def preprocess_payload(self):
         data = self.data_df.copy()
         num_rows = len(data)
 
@@ -460,7 +522,7 @@ class ZeroShotDataset:
 
         if self.use_competition_extension:
             external_code_col = self._resolve_single_column(data, "external_code")
-            _ = external_code_col  # alleen om te valideren dat hij bestaat
+            _ = external_code_col  # validatie
 
             neighbor_categories_all = np.empty((num_rows, self.competition_top_k), dtype=np.int64)
             neighbor_colors_all = np.empty((num_rows, self.competition_top_k), dtype=np.int64)
@@ -534,44 +596,74 @@ class ZeroShotDataset:
             )
         )
 
-        item_sales = self._get_sales_tensor(data, target_cols=target_cols)
-        temporal_features = self._extract_temporal_features(data, temporal_cols=temporal_cols)
+        payload = {
+            "item_sales": self._get_sales_tensor(data, target_cols=target_cols),
+            "categories": categories,
+            "colors": colors,
+            "fabrics": fabrics,
+            "temporal_features": self._extract_temporal_features(data, temporal_cols=temporal_cols),
+            "gtrends": multitrends,
+            "img_paths": image_paths,
+        }
 
-        if not self.use_competition_extension:
-            return LazyDataset(
-                item_sales=item_sales,
-                categories=categories,
-                colors=colors,
-                fabrics=fabrics,
-                temporal_features=temporal_features,
-                gtrends=multitrends,
-                img_paths=image_paths,
-                img_root=self.img_root,
+        if self.use_competition_extension:
+            payload.update(
+                {
+                    "neighbor_categories": torch.from_numpy(neighbor_categories_all),
+                    "neighbor_colors": torch.from_numpy(neighbor_colors_all),
+                    "neighbor_fabrics": torch.from_numpy(neighbor_fabrics_all),
+                    "neighbor_img_paths": neighbor_img_paths_all,
+                    "neighbor_scores": torch.from_numpy(neighbor_scores_all),
+                    "neighbor_mask": torch.from_numpy(neighbor_mask_all),
+                }
             )
 
+        return payload
+
+    def _build_dataset_from_payload(self, payload):
         return LazyDataset(
-            item_sales=item_sales,
-            categories=categories,
-            colors=colors,
-            fabrics=fabrics,
-            temporal_features=temporal_features,
-            gtrends=multitrends,
-            img_paths=image_paths,
+            item_sales=payload["item_sales"],
+            categories=payload["categories"],
+            colors=payload["colors"],
+            fabrics=payload["fabrics"],
+            temporal_features=payload["temporal_features"],
+            gtrends=payload["gtrends"],
+            img_paths=payload["img_paths"],
             img_root=self.img_root,
-            neighbor_categories=torch.from_numpy(neighbor_categories_all),
-            neighbor_colors=torch.from_numpy(neighbor_colors_all),
-            neighbor_fabrics=torch.from_numpy(neighbor_fabrics_all),
-            neighbor_img_paths=neighbor_img_paths_all,
-            neighbor_scores=torch.from_numpy(neighbor_scores_all),
-            neighbor_mask=torch.from_numpy(neighbor_mask_all),
+            img_tensor_root=self.img_tensor_root,
+            neighbor_categories=payload.get("neighbor_categories"),
+            neighbor_colors=payload.get("neighbor_colors"),
+            neighbor_fabrics=payload.get("neighbor_fabrics"),
+            neighbor_img_paths=payload.get("neighbor_img_paths"),
+            neighbor_scores=payload.get("neighbor_scores"),
+            neighbor_mask=payload.get("neighbor_mask"),
         )
 
-    def get_loader(self, batch_size, train=True):
-        print("Starting dataset creation process...")
-        data_with_gtrends = self.preprocess_data()
+    def preprocess_data(self):
+        img_tensor_root = self.img_tensor_root,
+        payload = self.preprocess_payload()
+        return self._build_dataset_from_payload(payload)
+
+    def get_loader(self, batch_size, train=True, cache_path=None, rebuild_cache=False):
+        if cache_path is not None:
+            cache_path = Path(cache_path)
+
+        if cache_path is not None and cache_path.exists() and not rebuild_cache:
+            print(f"Loading cached preprocessing from: {cache_path}")
+            payload = torch.load(cache_path, weights_only=False)
+        else:
+            print("Starting dataset creation process...")
+            payload = self.preprocess_payload()
+
+            if cache_path is not None:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(payload, cache_path)
+                print(f"Saved cached preprocessing to: {cache_path}")
+
+        data_with_gtrends = self._build_dataset_from_payload(payload)
 
         cpu_count = os.cpu_count() or 0
-        num_workers = min(8, cpu_count)
+        num_workers = min(4, cpu_count)
         pin_memory = torch.cuda.is_available()
 
         loader_kwargs = {

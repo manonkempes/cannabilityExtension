@@ -74,18 +74,22 @@ def build_availability_matrix(
     calendar_weeks = pd.date_range(start=min_week, end=max_week, freq="7D")
     week_labels = [week.strftime("%Y-%m-%d") for week in calendar_weeks]
 
+    # Vectorized availability computation
+    release_weeks = working["release_week_start"].to_numpy(dtype="datetime64[D]")
+    cal_weeks = calendar_weeks.to_numpy(dtype="datetime64[D]")
+
+    # Shape: (num_products, num_weeks)
+    diff_days = (cal_weeks[None, :] - release_weeks[:, None]).astype("timedelta64[D]").astype(int)
+    diff_weeks = diff_days // 7
+
+    availability = ((diff_weeks >= 0) & (diff_weeks < horizon_weeks)).astype(np.int8)
+
     availability_matrix = pd.DataFrame(
-        0,
-        index=working["product_id"],
+        availability,
+        index=working["product_id"].astype(str),
         columns=week_labels,
         dtype=np.int8,
     )
-
-    for _, row in working.iterrows():
-        start_week = row["release_week_start"]
-        active_weeks = pd.date_range(start=start_week, periods=horizon_weeks, freq="7D")
-        active_labels = [week.strftime("%Y-%m-%d") for week in active_weeks]
-        availability_matrix.loc[row["product_id"], active_labels] = 1
 
     row_mapping = working[[id_col, date_col, "release_week_start", "product_id"]].copy()
     row_mapping[date_col] = row_mapping[date_col].dt.strftime("%Y-%m-%d")
@@ -194,29 +198,33 @@ def build_topk_neighbors(
     topk_indices = np.full((num_weeks, num_products, top_k), -1, dtype=np.int32)
     topk_values = np.zeros((num_weeks, num_products, top_k), dtype=np.float32)
 
-    for t in range(num_weeks):
-        for i in range(num_products):
-            scores = masked_candidate_similarity[t, i].copy()
+    effective_top_k = min(top_k, num_products - (1 if exclude_self else 0))
+    if effective_top_k <= 0:
+        return topk_indices, topk_values
 
-            if exclude_self:
-                scores[i] = -1.0
+    scores = masked_candidate_similarity.copy()
 
-            positive_positions = np.where(scores > 0)[0]
-            if len(positive_positions) == 0:
-                continue
+    if exclude_self:
+        idx = np.arange(num_products)
+        scores[:, idx, idx] = -1.0
 
-            current_k = min(top_k, len(positive_positions))
-            candidate_scores = scores[positive_positions]
+    # Neem per (week, product_i) de indices van de grootste effective_top_k scores
+    kth = num_products - effective_top_k
+    part = np.argpartition(scores, kth=kth, axis=2)[:, :, -effective_top_k:]
+    part_scores = np.take_along_axis(scores, part, axis=2)
 
-            best_local = np.argpartition(candidate_scores, -current_k)[-current_k:]
-            best_global = positive_positions[best_local]
+    # Sorteer die Top-K kandidaten alsnog aflopend
+    order = np.argsort(part_scores, axis=2)[:, :, ::-1]
+    ranked_indices = np.take_along_axis(part, order, axis=2).astype(np.int32)
+    ranked_values = np.take_along_axis(part_scores, order, axis=2).astype(np.float32)
 
-            sorted_order = np.argsort(scores[best_global])[::-1]
-            ranked_indices = best_global[sorted_order]
-            ranked_values = scores[ranked_indices]
+    # Alleen positieve scores zijn geldig
+    invalid = ranked_values <= 0
+    ranked_indices[invalid] = -1
+    ranked_values[invalid] = 0.0
 
-            topk_indices[t, i, :current_k] = ranked_indices
-            topk_values[t, i, :current_k] = ranked_values
+    topk_indices[:, :, :effective_top_k] = ranked_indices
+    topk_values[:, :, :effective_top_k] = ranked_values
 
     return topk_indices, topk_values
 

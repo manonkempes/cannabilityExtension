@@ -43,6 +43,7 @@ def build_test_loader(test_df, args, gtrends, cat_dict, col_dict, fab_dict):
     dataset = ZeroShotDataset(
         data_df=test_df,
         img_root=Path(args.data_folder) / "images",
+        img_tensor_root=Path(args.data_folder) / "images_pt",
         gtrends=gtrends,
         cat_dict=cat_dict,
         col_dict=col_dict,
@@ -61,7 +62,11 @@ def build_test_loader(test_df, args, gtrends, cat_dict, col_dict, fab_dict):
         competition_meta_path=args.competition_meta_path if use_competition else None,
         competition_top_k=args.competition_top_k,
     )
-    return dataset.get_loader(batch_size=1, train=False)
+    return dataset.get_loader(
+        batch_size=args.test_batch_size,
+        train=False,
+        cache_path=Path(args.data_folder) / "cache" / "test_cache.pt",
+    )
 
 
 def build_model(args, cat_dict, col_dict, fab_dict):
@@ -308,6 +313,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--model_output_dim", type=int, default=12)
     parser.add_argument("--eval_horizon", type=int, default=12)
+    parser.add_argument("--test_batch_size", type=int, default=8)
     parser.add_argument("--use_encoder_mask", type=int, default=1)
     parser.add_argument("--autoregressive", type=int, default=0)
     parser.add_argument("--num_attn_heads", type=int, default=4)
