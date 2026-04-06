@@ -178,7 +178,6 @@ def build_masked_candidate_similarity_tensor(
     ).astype(np.float32)
     return masked_candidate_similarity
 
-
 def build_topk_neighbors(
     masked_candidate_similarity: np.ndarray,
     top_k: int,

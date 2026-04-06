@@ -599,6 +599,7 @@ class GTM(pl.LightningModule):
             forecast = self.decoder_step_fc(decoder_out).squeeze(-1)
             return forecast, attn_weights, diagnostics
 
+
         if self.autoregressive == 1:
             tgt = torch.zeros(
                 gtrend_encoding.shape[0],

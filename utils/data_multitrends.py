@@ -640,6 +640,7 @@ class ZeroShotDataset:
             neighbor_mask=payload.get("neighbor_mask"),
         )
 
+
     def preprocess_data(self):
         payload = self.preprocess_payload()
         return self._build_dataset_from_payload(payload)
