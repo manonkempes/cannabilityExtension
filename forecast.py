@@ -260,6 +260,7 @@ def run(args):
             batch = [tensor.to(device) if torch.is_tensor(tensor) else tensor for tensor in batch]
             item_sales, y_pred, attn = unpack_and_forward(model, batch, args.model_type)
 
+
         y_pred_np = y_pred.detach().cpu().numpy().reshape(y_pred.size(0), -1)
         y_true_np = item_sales.detach().cpu().numpy().reshape(item_sales.size(0), -1)
 
